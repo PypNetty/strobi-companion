@@ -1,0 +1,118 @@
+:root {
+  color: #e8eefc;
+  font-family: 'Segoe UI', sans-serif;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+}
+
+.stage {
+  width: 240px;
+  height: 240px;
+  cursor: grab;
+}
+
+.stage:active {
+  cursor: grabbing;
+}
+
+.hud {
+  width: 240px;
+  padding: 6px 8px 10px;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.shell:hover .hud,
+.hud:focus-within {
+  opacity: 1;
+}
+
+.privacy,
+.error,
+.state,
+.camera,
+.name {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.name {
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.privacy {
+  color: rgba(232, 238, 252, 0.82);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.camera {
+  margin-top: 4px;
+  color: rgba(232, 238, 252, 0.72);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.hud-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8b93a7;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.2);
+}
+
+.dot.on {
+  background: #7dffb3;
+}
+
+.dot.off {
+  background: #ff8d8d;
+}
+
+.state {
+  flex: 1;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+.toggle {
+  border: 0;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font: inherit;
+  font-size: 11px;
+  color: #101218;
+  background: #e8eefc;
+  cursor: pointer;
+}
+
+.error {
+  margin-top: 6px;
+  color: #ffb4b4;
+}

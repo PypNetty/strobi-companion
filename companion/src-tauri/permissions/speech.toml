@@ -1,0 +1,13 @@
+[[permission]]
+identifier = "allow-speech"
+description = "Speak, listen and answer locally"
+commands.allow = [
+  "speak",
+  "stop_speaking",
+  "start_listening",
+  "stop_listening",
+  "pause_listening",
+  "resume_listening",
+  "answer",
+  "voice_stack",
+]
