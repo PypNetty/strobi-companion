@@ -68,10 +68,10 @@ public static class ListenHost {
       engine.SpeechRecognized += (s, e) => {
         if (paused) return;
         if (e == null || e.Result == null) return;
-        if (e.Result.Confidence < 0.18f) return;
+        if (e.Result.Confidence < 0.22f) return;
         var text = e.Result.Text;
         if (string.IsNullOrWhiteSpace(text)) return;
-        if (IsDuplicate(text)) return;
+        if (IsWeak(text) || IsDuplicate(text)) return;
         var conf = e.Result.Confidence.ToString("0.00", CultureInfo.InvariantCulture);
         Write("R " + conf + " " + ToHex(text.Trim()));
       };
@@ -84,6 +84,19 @@ public static class ListenHost {
       return "ok";
     } catch {
       return "E start";
+    }
+  }
+
+  static bool IsWeak(string text) {
+    var folded = text.Trim().ToLowerInvariant();
+    if (folded.Length < 3) return true;
+    switch (folded) {
+      case "un": case "une": case "en": case "et": case "ou":
+      case "de": case "le": case "la": case "les": case "du":
+      case "soit": case "sois": case "euh": case "heu": case "hum":
+        return true;
+      default:
+        return false;
     }
   }
 
@@ -134,15 +147,22 @@ public static class ListenHost {
       "orange", "rouge", "bleu", "bleue", "rose", "vert", "verte",
       "violet", "violette", "jaune", "noir", "noire", "blanc", "blanche"
     };
+    var animals = new string[] {
+      "lapin", "lapine", "chat", "chatte", "chaton", "chien", "chein", "chienne",
+      "toutou", "ours", "ourse", "oiseau", "poisson", "blob", "slime",
+      "dragon", "robot", "fleur", "fantome", "fantôme", "licorne", "soleil",
+      "alien", "fraise", "demon", "diable", "ange", "fusee", "etoile",
+      "lion", "renard", "loup", "serpent", "elephant", "abeille", "dinosaure",
+      "voiture", "avion", "lune", "nuage", "arbre", "monstre", "coeur"
+    };
     var shapePrefixes = new string[] {
-      "un", "une", "en",
       "sois un", "sois une", "soit un", "soit une",
       "deviens un", "deviens une", "devient un", "devient une",
       "comme un", "comme une",
       "change toi en", "changes toi en", "fais toi en",
       "transforme toi en"
     };
-    LoadPhraseGrammar(host, culture, "talk", 120,
+    LoadPhraseGrammar(host, culture, "talk", 128,
       "comment tu t'appelles", "qui es-tu", "qui es tu", "ca va", "ça va",
       "comment ça va", "comment ca va", "comment tu vas", "tu me vois",
       "tu es là", "tu es la", "tu m'entends", "tu m entends",
@@ -154,13 +174,23 @@ public static class ListenHost {
       "reviens à ta couleur", "reviens a ta couleur", "couleur normale",
       "reviens à toi", "reviens a toi", "redeviens strobi", "redeviens Strobi"
     );
-    LoadPrefixGrammar(host, culture, "color", 124,
+    LoadPrefixGrammar(host, culture, "color", 126,
       new string[] { "sois", "soit", "deviens", "couleur" },
       colors);
-    LoadPrefixDictation(host, culture, "shape-dictation", 132, shapePrefixes);
+    LoadPrefixGrammar(host, culture, "animal", 122,
+      new string[] {
+        "un", "une", "sois un", "sois une", "soit un", "soit une",
+        "deviens un", "deviens une", "comme un", "comme une"
+      },
+      animals);
+    {
+      var names = Cultured(culture);
+      names.Append(new Choices(animals));
+      host.LoadGrammar(new Grammar(names) { Name = "creature-names", Priority = 120 });
+    }
+    LoadPrefixDictation(host, culture, "shape-dictation", 110, shapePrefixes);
     try {
-      var free = new DictationGrammar() { Name = "dictation", Weight = 1.0f, Priority = 40 };
-      host.LoadGrammar(free);
+      host.LoadGrammar(new DictationGrammar() { Name = "dictation", Weight = 0.45f, Priority = 8 });
     } catch {}
   }
 
@@ -254,7 +284,7 @@ public static class ListenHost {
 
 function Install-ListenHost {
   $speechAsm = [System.Speech.Recognition.SpeechRecognitionEngine].Assembly.Location
-  $dll = Join-Path $env:TEMP 'companion-stt-host-v11.dll'
+  $dll = Join-Path $env:TEMP 'companion-stt-host-v12.dll'
   if (Test-Path $dll) {
     try {
       [void][Reflection.Assembly]::LoadFrom($dll)
