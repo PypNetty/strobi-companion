@@ -1,4 +1,4 @@
-import { shouldAckHeardVoice } from '../listen'
+import { createListenPauseGate, shouldAckHeardVoice } from '../listen'
 
 describe('voice activity fallback', () => {
   it('acks when Windows dictation is off or failed', () => {
@@ -62,5 +62,30 @@ describe('voice activity fallback', () => {
         missedVad: 4,
       })
     ).toBe(false)
+  })
+})
+
+describe('listen pause gate', () => {
+  it('resumes even if a pause call finishes after resume was requested', async () => {
+    const calls: string[] = []
+    let finishPause: (() => void) | undefined
+    const gate = createListenPauseGate({
+      pause: () =>
+        new Promise(resolve => {
+          calls.push('pause')
+          finishPause = resolve
+        }),
+      resume: async () => {
+        calls.push('resume')
+      },
+    })
+    const pausing = gate.pause()
+    await Promise.resolve()
+    await Promise.resolve()
+    const resuming = gate.resume()
+    finishPause?.()
+    await pausing
+    await resuming
+    expect(calls).toEqual(['pause', 'resume'])
   })
 })

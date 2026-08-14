@@ -21,6 +21,8 @@ describe('creature recipes', () => {
 
   it('keeps animal recipes distinct from the default dumpling', () => {
     expect(creatureRecipes.chat.body.nodes.some(node => node.id === 'tail')).toBe(true)
+    expect(earNodesOf(creatureRecipes.chien)).toHaveLength(2)
+    expect(creatureRecipes.chien.body.nodes.some(node => node.id === 'snout')).toBe(true)
     expect(creatureRecipes.ours.body.primary.width).toBeGreaterThan(
       creatureRecipes.strobi.body.primary.width
     )

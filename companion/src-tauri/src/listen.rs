@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -39,6 +39,8 @@ public static class ListenHost {
   static volatile bool quit;
   static volatile bool needRestart;
   public static volatile bool Finished;
+  static string lastHeard = "";
+  static int lastHeardAt;
 
   public static string Boot() {
     try {
@@ -64,10 +66,12 @@ public static class ListenHost {
       LoadGrammars(engine, chosen.Culture);
       engine.SpeechDetected += (s, e) => Write("D");
       engine.SpeechRecognized += (s, e) => {
+        if (paused) return;
         if (e == null || e.Result == null) return;
         if (e.Result.Confidence < 0.18f) return;
         var text = e.Result.Text;
         if (string.IsNullOrWhiteSpace(text)) return;
+        if (IsDuplicate(text)) return;
         var conf = e.Result.Confidence.ToString("0.00", CultureInfo.InvariantCulture);
         Write("R " + conf + " " + ToHex(text.Trim()));
       };
@@ -83,32 +87,80 @@ public static class ListenHost {
     }
   }
 
+  static bool IsDuplicate(string text) {
+    var folded = text.Trim().ToLowerInvariant();
+    var now = Environment.TickCount;
+    if (folded == lastHeard && unchecked(now - lastHeardAt) < 1200) return true;
+    lastHeard = folded;
+    lastHeardAt = now;
+    return false;
+  }
+
+  static GrammarBuilder Cultured(CultureInfo culture) {
+    var builder = new GrammarBuilder();
+    if (culture != null) builder.Culture = culture;
+    return builder;
+  }
+
+  static void LoadPhraseGrammar(SpeechRecognitionEngine host, CultureInfo culture, string name, int priority, params string[] phrases) {
+    var choices = new Choices();
+    foreach (var phrase in phrases) choices.Add(phrase);
+    var builder = Cultured(culture);
+    builder.Append(choices);
+    host.LoadGrammar(new Grammar(builder) { Name = name, Priority = priority });
+  }
+
+  static void LoadPrefixGrammar(SpeechRecognitionEngine host, CultureInfo culture, string name, int priority, string[] prefixes, string[] tails) {
+    var prefix = new Choices(prefixes);
+    var tail = new Choices(tails);
+    var builder = Cultured(culture);
+    builder.Append(prefix);
+    builder.Append(tail);
+    host.LoadGrammar(new Grammar(builder) { Name = name, Priority = priority });
+  }
+
+  static void LoadPrefixDictation(SpeechRecognitionEngine host, CultureInfo culture, string name, int priority, string[] prefixes) {
+    try {
+      var prefix = new Choices(prefixes);
+      var builder = Cultured(culture);
+      builder.Append(prefix);
+      builder.AppendDictation();
+      host.LoadGrammar(new Grammar(builder) { Name = name, Priority = priority });
+    } catch {}
+  }
+
   static void LoadGrammars(SpeechRecognitionEngine host, CultureInfo culture) {
-    var phrases = new Choices();
-    string[] list = {
+    var colors = new string[] {
+      "orange", "rouge", "bleu", "bleue", "rose", "vert", "verte",
+      "violet", "violette", "jaune", "noir", "noire", "blanc", "blanche"
+    };
+    var shapePrefixes = new string[] {
+      "un", "une", "en",
+      "sois un", "sois une", "soit un", "soit une",
+      "deviens un", "deviens une", "devient un", "devient une",
+      "comme un", "comme une",
+      "change toi en", "changes toi en", "fais toi en",
+      "transforme toi en"
+    };
+    LoadPhraseGrammar(host, culture, "talk", 120,
       "comment tu t'appelles", "qui es-tu", "qui es tu", "ca va", "ça va",
       "comment ça va", "comment ca va", "comment tu vas", "tu me vois",
       "tu es là", "tu es la", "tu m'entends", "tu m entends",
       "il est quelle heure", "quelle heure est-il", "bonne nuit",
       "arrête", "arrete", "stop", "tais toi", "silence",
       "bonjour", "coucou", "salut", "hello", "bonsoir",
-      "orange", "rouge", "bleu", "bleue", "rose", "vert", "verte",
-      "violet", "violette", "jaune", "noir", "noire", "blanc", "blanche",
-      "sois orange", "sois rouge", "sois bleu", "sois bleue", "sois rose",
-      "sois vert", "sois verte", "sois violet", "sois violette",
-      "sois jaune", "sois noir", "sois noire", "sois blanc", "sois blanche",
-      "deviens orange", "deviens rouge", "couleur orange", "couleur rouge",
-      "rire", "sourire", "colère", "colere", "triste", "surprise", "dodo",
-      "fais dodo", "reviens à ta couleur", "reviens a ta couleur",
-      "couleur normale", "je suis strobi", "strobi"
-    };
-    foreach (var phrase in list) phrases.Add(phrase);
-    var builder = new GrammarBuilder();
-    if (culture != null) builder.Culture = culture;
-    builder.Append(phrases);
-    host.LoadGrammar(new Grammar(builder) { Name = "intents", Priority = 127 });
+      "rire", "sourire", "colère", "colere", "en colère", "en colere",
+      "triste", "surprise", "dodo", "fais dodo", "joyeuse", "joyeux",
+      "reviens à ta couleur", "reviens a ta couleur", "couleur normale",
+      "reviens à toi", "reviens a toi", "redeviens strobi", "redeviens Strobi"
+    );
+    LoadPrefixGrammar(host, culture, "color", 124,
+      new string[] { "sois", "soit", "deviens", "couleur" },
+      colors);
+    LoadPrefixDictation(host, culture, "shape-dictation", 132, shapePrefixes);
     try {
-      host.LoadGrammar(new DictationGrammar() { Name = "dictation", Weight = 0.45f, Priority = 0 });
+      var free = new DictationGrammar() { Name = "dictation", Weight = 1.0f, Priority = 40 };
+      host.LoadGrammar(free);
     } catch {}
   }
 
@@ -202,7 +254,7 @@ public static class ListenHost {
 
 function Install-ListenHost {
   $speechAsm = [System.Speech.Recognition.SpeechRecognitionEngine].Assembly.Location
-  $dll = Join-Path $env:TEMP 'companion-stt-host-v6.dll'
+  $dll = Join-Path $env:TEMP 'companion-stt-host-v11.dll'
   if (Test-Path $dll) {
     try {
       [void][Reflection.Assembly]::LoadFrom($dll)
@@ -462,6 +514,10 @@ fn wait_for_ready(rx: &Receiver<String>) -> Result<(), String> {
 
 fn spawn_event_pump(app: AppHandle, rx: Receiver<String>, dead: Arc<AtomicBool>) {
     thread::spawn(move || {
+        let mut last_text = String::new();
+        let mut last_at = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
         while let Ok(line) = rx.recv() {
             if line.eq_ignore_ascii_case("ok") || line.is_empty() {
                 continue;
@@ -475,6 +531,13 @@ fn spawn_event_pump(app: AppHandle, rx: Receiver<String>, dead: Arc<AtomicBool>)
                 continue;
             }
             if let Some(payload) = parse_transcript(&line) {
+                let folded = payload.text.trim().to_lowercase();
+                let now = Instant::now();
+                if folded == last_text && now.duration_since(last_at) < Duration::from_millis(1_200) {
+                    continue;
+                }
+                last_text = folded;
+                last_at = now;
                 let _ = app.emit("companion://transcript", payload);
             }
         }

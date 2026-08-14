@@ -1,4 +1,4 @@
-import { creatureRecipes, type CreatureRecipeId } from '../avatar/recipes'
+import { creatureFromName, foldSpoken } from '../avatar/fromName'
 
 export type ColorName =
   | 'orange'
@@ -13,8 +13,6 @@ export type ColorName =
 
 export type MoodName = 'laugh' | 'angry' | 'happy' | 'sad' | 'surprised' | 'sleepy'
 
-export type AnimalRecipeId = Exclude<CreatureRecipeId, 'strobi'>
-
 export type CompanionIntent =
   | { type: 'name' }
   | { type: 'hello' }
@@ -25,10 +23,12 @@ export type CompanionIntent =
   | { type: 'stop' }
   | { type: 'color'; color: ColorName }
   | { type: 'colorReset' }
-  | { type: 'shape'; recipe: AnimalRecipeId }
+  | { type: 'shape'; name: string }
   | { type: 'shapeReset' }
   | { type: 'mood'; mood: MoodName }
   | { type: 'unknown' }
+
+export { foldSpoken }
 
 export type CompanionColorOverride = {
   body?: string
@@ -93,16 +93,6 @@ export const sequenceIdForMood = (mood: MoodName) => {
   }
 }
 
-const fold = (value: string) =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/\p{M}/gu, '')
-    .replace(/['’`]/g, ' ')
-    .replace(/[^a-z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
 const includesAny = (text: string, needles: readonly string[]) =>
   needles.some(needle => text.includes(needle))
 
@@ -116,14 +106,19 @@ const hasAnyToken = (text: string, tokens: readonly string[]) =>
 const colorChangeCue = (text: string) =>
   includesAny(text, [
     'sois',
+    'soit',
     'deviens',
     'devenir',
+    'devient',
     'je veux',
+    'voudrais',
     'mets toi',
     'passe en',
     'couleur',
     'tu es',
     't es',
+    'change toi',
+    'peux tu',
   ])
 
 const namedColor = (text: string): ColorName | null => {
@@ -153,52 +148,299 @@ const classifyColor = (text: string): CompanionIntent | null => {
   return null
 }
 
-const animalTokens: Record<AnimalRecipeId, readonly string[]> = {
-  lapin: ['lapin', 'lapine', 'lapins'],
-  chat: ['chat', 'chatte', 'chaton', 'minou'],
-  ours: ['ours', 'ourse', 'ourson'],
-  oiseau: ['oiseau', 'oiseaux', 'piaf'],
-  poisson: ['poisson', 'poissons'],
-  blob: ['blob', 'slime', 'gelee', 'gelatine'],
-}
+const articles = new Set(['un', 'une', 'le', 'la', 'les', 'des', 'du', 'de', 'l', 'au', 'aux', 'a'])
 
-const animalOrder: readonly AnimalRecipeId[] = [
-  'lapin',
-  'chat',
-  'ours',
-  'oiseau',
-  'poisson',
-  'blob',
+const shapeStopwords = new Set([
+  'je',
+  'tu',
+  'il',
+  'elle',
+  'on',
+  'nous',
+  'vous',
+  'ils',
+  'elles',
+  'et',
+  'ou',
+  'que',
+  'qui',
+  'quoi',
+  'ne',
+  'pas',
+  'me',
+  'te',
+  'se',
+  'ce',
+  'cet',
+  'cette',
+  'est',
+  'es',
+  'suis',
+  'sont',
+  'as',
+  'ai',
+  'ca',
+  'va',
+  'c',
+  's',
+  'd',
+  'n',
+  'm',
+  't',
+  'y',
+  'en',
+  'passe',
+  'passer',
+  'change',
+  'changes',
+  'transforme',
+  'ressemble',
+  'ressembles',
+  'veux',
+  'voudrais',
+  'peux',
+  'devenir',
+  'devient',
+  'deviens',
+  'sois',
+  'soit',
+  'comme',
+  'mets',
+  'fais',
+  'fait',
+  'peux',
+  ...articles,
+])
+
+const reservedShapeTokens = new Set([
+  'orange',
+  'rouge',
+  'bleu',
+  'bleue',
+  'rose',
+  'vert',
+  'verte',
+  'violet',
+  'violette',
+  'jaune',
+  'noir',
+  'noire',
+  'blanc',
+  'blanche',
+  'bonjour',
+  'coucou',
+  'salut',
+  'hello',
+  'bonsoir',
+  'stop',
+  'arrete',
+  'stoppe',
+  'silence',
+  'rire',
+  'ris',
+  'mdr',
+  'haha',
+  'hihi',
+  'rigole',
+  'sourire',
+  'joyeuse',
+  'joyeux',
+  'contente',
+  'content',
+  'heureuse',
+  'heureux',
+  'colere',
+  'fache',
+  'fachee',
+  'enerve',
+  'enervee',
+  'grrr',
+  'triste',
+  'tristesse',
+  'surprise',
+  'surpris',
+  'etonnee',
+  'etonne',
+  'waouh',
+  'wow',
+  'dodo',
+  'sleepy',
+  'somnolente',
+  'somnolent',
+  'strobi',
+  'merci',
+  'oui',
+  'non',
+  'accord',
+  'couleur',
+  'forme',
+  'apparence',
+])
+
+const shapePrefixes = [
+  'je voudrais que tu ressembles a un',
+  'je voudrais que tu ressembles a une',
+  'je voudrais que tu sois un',
+  'je voudrais que tu sois une',
+  'je voudrais que tu sois',
+  'je voudrais que tu deviennes un',
+  'je voudrais que tu deviennes une',
+  'je voudrais un',
+  'je voudrais une',
+  'je veux que tu ressembles a un',
+  'je veux que tu ressembles a une',
+  'je veux que tu ressembles a',
+  'je veux que tu sois un',
+  'je veux que tu sois une',
+  'je veux que tu sois',
+  'je veux que tu deviennes un',
+  'je veux que tu deviennes une',
+  'je veux que tu deviennes',
+  'peux tu devenir un',
+  'peux tu devenir une',
+  'peux tu etre un',
+  'peux tu etre une',
+  'tu peux devenir un',
+  'tu peux devenir une',
+  'je veux un',
+  'je veux une',
+  'ressembles a un',
+  'ressembles a une',
+  'ressembles a',
+  'ressemble a un',
+  'ressemble a une',
+  'ressemble a',
+  'transforme toi en',
+  'transforme en',
+  'change toi en',
+  'changes toi en',
+  'te changes en',
+  'te change en',
+  'fais toi en',
+  'fait toi en',
+  'mets toi en',
+  'passe en',
+  'deviens un',
+  'deviens une',
+  'devient un',
+  'devient une',
+  'deviens',
+  'devient',
+  'sois un',
+  'sois une',
+  'soit un',
+  'soit une',
+  'comme un',
+  'comme une',
+  'tu es un',
+  'tu es une',
+  't es un',
+  't es une',
+  'sois',
+  'soit',
+  'comme',
+  'un',
+  'une',
+  'en',
 ]
 
-const namedAnimal = (text: string): AnimalRecipeId | null => {
-  for (const recipe of animalOrder) {
-    if (hasAnyToken(text, animalTokens[recipe])) return recipe
+const spokenFillers = [
+  'euh',
+  'heu',
+  'hum',
+  'ben',
+  'bah',
+  'alors',
+  'donc',
+  'hey',
+  'oh',
+  'ah',
+  's il te plait',
+  'sil te plait',
+  'please',
+] as const
+
+const stripSpokenExtras = (text: string) => {
+  let next = text.replace(/^(dis |hey |allo )?(strobi)\s+/, '')
+  for (const filler of spokenFillers) {
+    next = next.replace(new RegExp(`(?:^| )${filler}(?: |$)`, 'g'), ' ')
+  }
+  return next.replace(/\s+/g, ' ').trim()
+}
+
+const shapeLeadTokens = new Set([
+  'sois',
+  'soit',
+  'deviens',
+  'devient',
+  'devien',
+  'comme',
+  'change',
+  'changes',
+  'transforme',
+  'fais',
+  'fait',
+  'mets',
+  'passe',
+  'toi',
+  'un',
+  'une',
+  'en',
+  'accord',
+])
+
+const peelShapeCommand = (text: string) => {
+  let next = text.trim()
+  let previous = ''
+  while (next && next !== previous) {
+    previous = next
+    const tokens = tokensOf(next)
+    const first = tokens[0]
+    if (first && shapeLeadTokens.has(first)) {
+      next = tokens.slice(1).join(' ')
+      continue
+    }
+    if (first) {
+      const stripped = first.replace(/^(sois|soit|deviens|devient|devien)(une|un)?/, '')
+      if (stripped !== first) {
+        tokens[0] = stripped
+        next = tokens.filter(Boolean).join(' ')
+      }
+    }
+  }
+  return next.trim()
+}
+
+const takeShapeName = (remainder: string): string | null => {
+  const tokens = tokensOf(peelShapeCommand(remainder))
+  while (tokens.length > 0 && articles.has(tokens[0] ?? '')) tokens.shift()
+  const nameTokens = tokens
+    .slice(0, 4)
+    .filter(token => !shapeStopwords.has(token) && !reservedShapeTokens.has(token) && !shapeLeadTokens.has(token))
+    .filter(token => token.length >= 3)
+  if (nameTokens.length === 0) return null
+  return nameTokens.join(' ')
+}
+
+const spokenShapeLabel = (name: string) => {
+  const peeled = takeShapeName(name) ?? peelShapeCommand(foldSpoken(name))
+  if (!peeled) return null
+  const tokens = tokensOf(foldSpoken(creatureFromName(peeled).label)).filter(
+    token => !shapeLeadTokens.has(token) && !shapeStopwords.has(token) && token.length >= 3
+  )
+  return tokens[tokens.length - 1] ?? null
+}
+
+const extractPrefixedShapeName = (text: string): string | null => {
+  const prefixes = [...shapePrefixes].sort((left, right) => right.length - left.length)
+  for (const prefix of prefixes) {
+    const index = text.indexOf(`${prefix} `)
+    if (index < 0) continue
+    const name = takeShapeName(text.slice(index + prefix.length))
+    if (name) return name
   }
   return null
 }
-
-const shapeChangeCue = (text: string) =>
-  includesAny(text, [
-    'ressembl',
-    'comme un',
-    'comme une',
-    'sois un',
-    'sois une',
-    'deviens un',
-    'deviens une',
-    'transforme',
-    'en lapin',
-    'en chat',
-    'en ours',
-    'en oiseau',
-    'en poisson',
-    'en blob',
-    'je veux',
-    'mets toi',
-    'tu es un',
-    't es un',
-  ])
 
 const classifyShapeReset = (text: string): CompanionIntent | null => {
   if (
@@ -219,11 +461,17 @@ const classifyShapeReset = (text: string): CompanionIntent | null => {
   return null
 }
 
-const classifyShape = (text: string): CompanionIntent | null => {
-  const recipe = namedAnimal(text)
-  if (!recipe) return null
-  if (shapeChangeCue(text) || tokensOf(text).length <= 3) return { type: 'shape', recipe }
+const classifyPrefixedShape = (text: string): CompanionIntent | null => {
+  const prefixed = extractPrefixedShapeName(text)
+  if (prefixed) return { type: 'shape', name: prefixed }
   return null
+}
+
+const classifyBareShape = (text: string): CompanionIntent | null => {
+  if (tokensOf(text).length > 2) return null
+  const name = takeShapeName(text)
+  if (!name) return null
+  return { type: 'shape', name }
 }
 
 const classifyMood = (text: string): CompanionIntent | null => {
@@ -257,7 +505,7 @@ const classifyMood = (text: string): CompanionIntent | null => {
 }
 
 export const classifyIntent = (utterance: string): CompanionIntent => {
-  const text = fold(utterance)
+  const text = stripSpokenExtras(foldSpoken(utterance))
   if (!text) return { type: 'unknown' }
   if (
     includesAny(text, ['arrete', 'stop', 'tais toi', 'taisez', 'silence', 'stoppe'])
@@ -266,8 +514,8 @@ export const classifyIntent = (utterance: string): CompanionIntent => {
   }
   const shapeReset = classifyShapeReset(text)
   if (shapeReset) return shapeReset
-  const shape = classifyShape(text)
-  if (shape) return shape
+  const prefixedShape = classifyPrefixedShape(text)
+  if (prefixedShape) return prefixedShape
   const color = classifyColor(text)
   if (color) return color
   const mood = classifyMood(text)
@@ -309,6 +557,8 @@ export const classifyIntent = (utterance: string): CompanionIntent => {
   if (includesAny(text, ['bonjour', 'coucou', 'salut', 'hello', 'bonsoir'])) {
     return { type: 'hello' }
   }
+  const shape = classifyBareShape(text)
+  if (shape) return shape
   return { type: 'unknown' }
 }
 
@@ -345,8 +595,10 @@ export const replyForIntent = (
       return `D’accord, ${intent.color}.`
     case 'colorReset':
       return 'D’accord, je reviens.'
-    case 'shape':
-      return `D’accord, ${creatureRecipes[intent.recipe].label}.`
+    case 'shape': {
+      const label = spokenShapeLabel(intent.name)
+      return label ? `D’accord, ${label}.` : 'D’accord.'
+    }
     case 'shapeReset':
       return 'D’accord, je redeviens moi.'
     case 'mood':
@@ -378,9 +630,37 @@ export const replyFromUtterance = (
   options: { random?: () => number; now?: Date } = {}
 ) => replyForIntent(classifyIntent(utterance), options)
 
-export const isLikelyEcho = (heard: string, spoken: string) => {
-  const left = fold(heard)
-  const right = fold(spoken)
+const contentTokens = (text: string) =>
+  tokensOf(text).filter(token => token.length >= 3 && !shapeStopwords.has(token))
+
+export const intentKey = (intent: CompanionIntent) => {
+  switch (intent.type) {
+    case 'shape':
+      return `shape:${foldSpoken(intent.name)}`
+    case 'color':
+      return `color:${intent.color}`
+    case 'mood':
+      return `mood:${intent.mood}`
+    default:
+      return intent.type
+  }
+}
+
+export const isLikelyEcho = (
+  heard: string,
+  spoken: string,
+  options: { duringSpeech?: boolean } = {},
+) => {
+  const left = foldSpoken(heard)
+  const right = foldSpoken(spoken)
   if (!left || !right) return false
-  return left === right || right.includes(left) || left.includes(right)
+  if (left === right) return true
+  if (options.duringSpeech) {
+    const heardTokens = contentTokens(left)
+    const spokenSet = new Set(tokensOf(right))
+    if (heardTokens.length > 0 && heardTokens.every(token => spokenSet.has(token))) return true
+    return right.includes(left) || left.includes(right)
+  }
+  if (left.length < 10) return false
+  return right.includes(left) || left.includes(right)
 }

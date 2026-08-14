@@ -31,9 +31,64 @@ export const shouldAckHeardVoice = (input: {
   return input.missedVad >= 3
 }
 
+export const createListenPauseGate = (driver: {
+  pause: () => Promise<void>
+  resume: () => Promise<void>
+}) => {
+  let desired = false
+  let actual = false
+  let chain = Promise.resolve()
+
+  const sync = () => {
+    chain = chain
+      .then(async () => {
+        if (desired === actual) return
+        if (desired) {
+          await driver.pause()
+          actual = true
+          if (!desired) {
+            await driver.resume()
+            actual = false
+          }
+        } else {
+          await driver.resume()
+          actual = false
+        }
+      })
+      .catch(() => undefined)
+    return chain
+  }
+
+  return {
+    pause() {
+      desired = true
+      return sync()
+    },
+    resume() {
+      desired = false
+      return sync()
+    },
+    reset() {
+      desired = false
+      actual = false
+      chain = Promise.resolve()
+    },
+  }
+}
+
 export class NativeListener {
   private unlisten: Array<() => void> = []
   private running = false
+  private readonly pauseGate = createListenPauseGate({
+    pause: async () => {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('pause_listening').catch(() => undefined)
+    },
+    resume: async () => {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke('resume_listening').catch(() => undefined)
+    },
+  })
 
   get active() {
     return this.running
@@ -73,6 +128,7 @@ export class NativeListener {
       }
       await invoke('start_listening')
       this.running = true
+      this.pauseGate.reset()
       try {
         const stack = await invoke<VoiceStack>('voice_stack')
         options.onStack?.(stack)
@@ -92,18 +148,17 @@ export class NativeListener {
 
   async pause() {
     if (!isTauri() || !this.running) return
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('pause_listening').catch(() => undefined)
+    await this.pauseGate.pause()
   }
 
   async resume() {
     if (!isTauri() || !this.running) return
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('resume_listening').catch(() => undefined)
+    await this.pauseGate.resume()
   }
 
   async stop() {
     this.running = false
+    this.pauseGate.reset()
     this.unlisten.forEach(stop => stop())
     this.unlisten = []
     if (!isTauri()) return

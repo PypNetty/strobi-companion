@@ -10,6 +10,7 @@ export const creatureRecipeIds = [
   'strobi',
   'lapin',
   'chat',
+  'chien',
   'ours',
   'oiseau',
   'poisson',
@@ -18,15 +19,17 @@ export const creatureRecipeIds = [
 
 export type CreatureRecipeId = (typeof creatureRecipeIds)[number]
 
+export type AnimalRecipeId = Exclude<CreatureRecipeId, 'strobi'>
+
 export type CreatureRecipe = {
-  id: CreatureRecipeId
+  id: string
   label: string
   body: AvatarBody
   colors: AvatarColors
   eyes: AvatarEyeDefaults
 }
 
-const surface = (
+export const surface = (
   type: SurfaceConfig['type'],
   width: number,
   height: number,
@@ -41,7 +44,7 @@ const surface = (
   ...extras,
 })
 
-const accessory = (
+export const accessory = (
   id: string,
   name: string,
   nextSurface: SurfaceConfig,
@@ -55,7 +58,7 @@ const accessory = (
   rotation,
 })
 
-const eyes = (
+export const eyes = (
   width: number,
   height: number,
   spacing: number,
@@ -74,7 +77,7 @@ const eyes = (
   rightAngle: 0,
 })
 
-const blush = (side: -1 | 1): BodyNode =>
+export const blush = (side: -1 | 1): BodyNode =>
   accessory(
     side < 0 ? 'blush-left' : 'blush-right',
     side < 0 ? 'Rougeur gauche' : 'Rougeur droite',
@@ -153,6 +156,44 @@ export const creatureRecipes: Record<CreatureRecipeId, CreatureRecipe> = {
     },
     colors: { body: '#efb36a', eyes: '#2a1c12' },
     eyes: eyes(22, 34, 34, -6),
+  },
+  chien: {
+    id: 'chien',
+    label: 'chien',
+    body: {
+      primary: surface('sphere', 200, 176, 188),
+      nodes: [
+        accessory(
+          'ear-left',
+          'Oreille gauche',
+          surface('capsule', 42, 88, 18),
+          [-78, -48, -6],
+          [18, 12, -58]
+        ),
+        accessory(
+          'ear-right',
+          'Oreille droite',
+          surface('capsule', 42, 88, 18),
+          [78, -48, -6],
+          [18, -12, 58]
+        ),
+        accessory(
+          'snout',
+          'Museau',
+          surface('sphere', 78, 54, 70),
+          [0, 38, 86]
+        ),
+        accessory(
+          'tail',
+          'Queue',
+          surface('capsule', 24, 86, 24),
+          [70, 78, -78],
+          [28, -22, 36]
+        ),
+      ],
+    },
+    colors: { body: '#d4a06a', eyes: '#2c1810' },
+    eyes: eyes(24, 26, 38, 4),
   },
   ours: {
     id: 'ours',

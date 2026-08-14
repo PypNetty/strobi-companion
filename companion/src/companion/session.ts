@@ -12,19 +12,22 @@ import {
   sequenceIdForState,
 } from './avatar/catalog'
 import { avatarFromRecipe, creatureRecipes } from './avatar/recipes'
+import { creatureFromName } from './avatar/fromName'
 import { eyeLookForCompanion, type EyeLookId } from './avatar/eyeLookMapping'
 import { mountCompanionAvatar, type CompanionRuntime } from './avatar/runtime'
 import { CompanionSpeech } from './voice/speech'
 import { VoiceActivityDetector } from './voice/activity'
-import { askLocalBrain, NativeListener, shouldAckHeardVoice, type VoiceStack } from './voice/listen'
+import { NativeListener, shouldAckHeardVoice, type VoiceStack } from './voice/listen'
 import {
   classifyIntent,
   colorOverrideFor,
-  formatLocalTime,
+  foldSpoken,
+  intentKey,
   isLikelyEcho,
   replyForIntent,
   sequenceIdForMood,
   type CompanionIntent,
+  type ColorName,
   type MoodName,
 } from './voice/intents'
 import { pickSpeechLine } from './voice/lines'
@@ -54,8 +57,6 @@ export type CompanionSessionOptions = {
 }
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-
-const watchingGapMs = () => 10_000 + Math.floor(Math.random() * 8_000)
 
 export class CompanionSession {
   private engine = new BehaviorEngine()
@@ -94,8 +95,6 @@ export class CompanionSession {
   private pointerWasActive = false
   private dragSpoken = false
   private shakeSpoken = false
-  private nextWatchingSpeechAt = 0
-  private skipReactionForGreeting = false
   private greetedUntil = 0
   private moodSequence: string | null = null
   private mood: MoodName | null = null
@@ -103,14 +102,27 @@ export class CompanionSession {
   private listenError?: string
   private missedVad = 0
   private lastListenRetry = 0
+  private pendingUtterance: string | null = null
+  private lastColor: ColorName | null = null
+  private lastHeardFold = ''
+  private lastHeardAt = 0
+  private lastIntentKey = ''
+  private lastIntentAt = 0
+  private echoGuardUntil = 0
 
   constructor(host: HTMLElement, options: CompanionSessionOptions = {}) {
     this.onStatus = options.onStatus
     this.speech = new CompanionSpeech({
       onSpeaking: speaking => {
         this.speaking = speaking
-        if (speaking) void this.listener.pause()
-        else void this.listener.resume()
+        if (speaking) {
+          void this.listener.pause()
+        } else {
+          this.echoGuardUntil = Date.now() + 400
+          this.answering = false
+          void this.listener.resume()
+          this.flushPendingUtterance()
+        }
         this.emitStatus()
       },
     })
@@ -257,8 +269,8 @@ export class CompanionSession {
         this.voicePresentUntil = Date.now() + 1_600
         this.engine.dispatch({ type: 'VOICE_DETECTED' })
         const grew = this.noticePresence()
+        if (this.speaking || this.answering) return
         if (!grew) {
-          if (this.speaking) this.speech.cancel()
           this.missedVad += 1
           if (
             shouldAckHeardVoice({
@@ -290,10 +302,10 @@ export class CompanionSession {
     const started = await this.listener.start({
       onTranscript: payload => this.onTranscript(payload.text),
       onSpeechStart: () => {
+        if (this.speaking || this.answering) return
         this.voicePresentUntil = Date.now() + 1_800
         this.engine.dispatch({ type: 'VOICE_DETECTED' })
         this.noticePresence()
-        if (this.speaking) this.speech.cancel()
         this.syncRuntime()
       },
       onStack: stack => this.onVoiceStack(stack),
@@ -318,7 +330,27 @@ export class CompanionSession {
 
   private onTranscript(text: string) {
     if (!this.voiceEnabled || this.destroyed) return
-    if (isLikelyEcho(text, this.lastSpoken)) return
+    const intent = classifyIntent(text)
+    const now = Date.now()
+    const busy = this.speaking || this.answering
+    const guardingEcho = busy || now < this.echoGuardUntil
+    if (intent.type === 'stop') {
+      this.pendingUtterance = null
+      this.speech.cancel()
+      void this.replyTo(text)
+      return
+    }
+    if (isLikelyEcho(text, this.lastSpoken, { duringSpeech: guardingEcho })) return
+    const folded = foldSpoken(text)
+    if (busy) {
+      if (folded && folded !== this.lastHeardFold) this.pendingUtterance = text
+      return
+    }
+    if (folded && folded === this.lastHeardFold && now - this.lastHeardAt < 1_800) return
+    if (folded) {
+      this.lastHeardFold = folded
+      this.lastHeardAt = now
+    }
     this.listenError = undefined
     this.missedVad = 0
     this.listening = true
@@ -329,21 +361,40 @@ export class CompanionSession {
   }
 
   private async replyTo(text: string) {
-    if (this.answering) return
+    if (this.answering) {
+      this.pendingUtterance = text
+      return
+    }
     this.answering = true
-    this.speech.cancel()
     try {
       const intent = classifyIntent(text)
+      const key = intentKey(intent)
+      const now = Date.now()
+      const repeat = key === this.lastIntentKey && now - this.lastIntentAt < 2_000
       this.applyAppearance(intent)
-      let reply = intent.type === 'unknown' ? await askLocalBrain(text, formatLocalTime()) : ''
-      if (!reply) reply = replyForIntent(intent)
+      if (repeat) return
+      this.lastIntentKey = key
+      this.lastIntentAt = now
+      const reply = replyForIntent(intent)
       this.lastSpoken = reply
       this.speech.speakText(reply)
     } finally {
-      this.answering = false
+      if (!this.speaking && !this.speech.isSpeaking) {
+        this.answering = false
+        this.flushPendingUtterance()
+      }
       this.syncRuntime()
       this.emitStatus()
     }
+  }
+
+  private flushPendingUtterance() {
+    const queued = this.pendingUtterance
+    this.pendingUtterance = null
+    if (!queued || this.answering || this.speaking) return
+    if (isLikelyEcho(queued, this.lastSpoken, { duringSpeech: true })) return
+    if (foldSpoken(queued) === this.lastHeardFold) return
+    void this.replyTo(queued)
   }
 
   private onPerception(state: PerceptionState) {
@@ -405,27 +456,12 @@ export class CompanionSession {
         this.mood = null
       }
       this.runtime.setSequence(this.moodSequence ?? sequenceIdForState(state))
-      if (state === 'waking') this.speakUnlessGreeting('waking')
-      if (state === 'curious') this.speakUnlessGreeting('curious')
       if (state === 'idle') this.restPresence()
-      if (state === 'sleeping') {
-        this.speech.speak('sleeping')
-        this.restPresence()
-      }
-      if (state === 'watching') this.nextWatchingSpeechAt = Date.now() + watchingGapMs()
+      if (state === 'sleeping') this.restPresence()
       this.lastState = state
       this.emitStatus()
     }
     const now = Date.now()
-    if (
-      state === 'watching' &&
-      !this.speaking &&
-      !this.answering &&
-      now >= this.nextWatchingSpeechAt
-    ) {
-      this.speech.speak('watching')
-      this.nextWatchingSpeechAt = now + watchingGapMs()
-    }
     const motion = this.cursor.motionGaze(now)
     this.refreshAttentionCues(motion)
     const voicePresent = now < this.voicePresentUntil
@@ -468,7 +504,6 @@ export class CompanionSession {
     } else {
       this.dragSpoken = false
       this.shakeSpoken = false
-      if (this.pointer.active && !this.pointerWasActive) this.speech.speak('noticed')
     }
     this.pointerWasActive = this.pointer.active
   }
@@ -479,7 +514,6 @@ export class CompanionSession {
 
   private noticePresence() {
     if (!this.presence.notice()) return false
-    this.skipReactionForGreeting = true
     this.greetedUntil = Date.now() + 2_400
     if (this.voiceEnabled) {
       const hello = pickSpeechLine('greeting')
@@ -495,27 +529,29 @@ export class CompanionSession {
 
   private restPresence() {
     if (!this.presence.rest()) return
-    this.skipReactionForGreeting = false
     void applyPresenceWindow(false)
     this.emitStatus()
   }
 
   private applyAppearance(intent: CompanionIntent) {
     if (intent.type === 'color') {
+      this.lastColor = intent.color
       this.runtime.setColors(colorOverrideFor(intent.color))
       return
     }
     if (intent.type === 'colorReset') {
+      this.lastColor = null
       this.runtime.setColors(null)
       return
     }
     if (intent.type === 'shape') {
-      this.runtime.setAvatar(avatarFromRecipe(creatureRecipes[intent.recipe]))
+      this.runtime.setAvatar(avatarFromRecipe(creatureFromName(intent.name)))
+      this.runtime.setColors(this.lastColor ? colorOverrideFor(this.lastColor) : null)
       return
     }
     if (intent.type === 'shapeReset') {
       this.runtime.setAvatar(avatarFromRecipe(creatureRecipes.strobi))
-      this.runtime.setColors(null)
+      this.runtime.setColors(this.lastColor ? colorOverrideFor(this.lastColor) : null)
       return
     }
     if (intent.type === 'mood') {
@@ -529,14 +565,6 @@ export class CompanionSession {
       this.moodSequence = null
       this.runtime.setSequence(sequenceIdForState(this.engine.state))
     }
-  }
-
-  private speakUnlessGreeting(cue: 'waking' | 'curious') {
-    if (this.skipReactionForGreeting) {
-      this.skipReactionForGreeting = false
-      return
-    }
-    this.speech.speak(cue)
   }
 
   private emitStatus() {
