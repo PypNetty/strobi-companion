@@ -115,12 +115,9 @@ export class CompanionSession {
     this.speech = new CompanionSpeech({
       onSpeaking: speaking => {
         this.speaking = speaking
-        if (speaking) {
-          void this.listener.pause()
-        } else {
+        if (!speaking) {
           this.echoGuardUntil = Date.now() + 400
           this.answering = false
-          void this.listener.resume()
           this.flushPendingUtterance()
         }
         this.emitStatus()
@@ -372,7 +369,7 @@ export class CompanionSession {
       const now = Date.now()
       const repeat = key === this.lastIntentKey && now - this.lastIntentAt < 2_000
       this.applyAppearance(intent)
-      if (repeat) return
+      if (repeat || intent.type === 'unknown') return
       this.lastIntentKey = key
       this.lastIntentAt = now
       const reply = replyForIntent(intent)

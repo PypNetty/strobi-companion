@@ -275,6 +275,12 @@ const reservedShapeTokens = new Set([
   'couleur',
   'forme',
   'apparence',
+  'peu',
+  'fois',
+  'chose',
+  'truc',
+  'mot',
+  'temps',
 ])
 
 const shapePrefixes = [
@@ -468,9 +474,9 @@ const classifyPrefixedShape = (text: string): CompanionIntent | null => {
 }
 
 const classifyBareShape = (text: string): CompanionIntent | null => {
-  if (tokensOf(text).length > 2) return null
+  if (tokensOf(text).length !== 1 && tokensOf(peelShapeCommand(text)).length !== 1) return null
   const name = takeShapeName(text)
-  if (!name) return null
+  if (!name || tokensOf(name).length !== 1) return null
   return { type: 'shape', name }
 }
 
