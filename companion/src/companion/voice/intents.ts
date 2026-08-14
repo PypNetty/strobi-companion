@@ -68,13 +68,7 @@ export const classifyIntent = (utterance: string): ReplyIntent => {
     return 'time'
   }
   if (
-    includesAny(text, [
-      'tu me vois',
-      'tu es la',
-      't es la',
-      'tu m entends',
-      'tu es la',
-    ])
+    includesAny(text, ['tu me vois', 'tu es la', 't es la', 'tu m entends'])
   ) {
     return 'presence'
   }

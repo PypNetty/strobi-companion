@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -229,29 +230,32 @@ fn synthesize_wav(ready: &PiperReady, text: &str) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::from_millis(1))
         .as_millis();
-    let input = dir.join(format!("strobi-{stamp}.txt"));
     let output = dir.join(format!("strobi-{stamp}.wav"));
-    fs::write(&input, format!("{trimmed}\n")).map_err(|error| error.to_string())?;
     let cwd = ready.exe.parent().unwrap_or_else(|| Path::new("."));
-    let status = Command::new(&ready.exe)
+    let mut child = Command::new(&ready.exe)
         .current_dir(cwd)
         .args([
             "-m",
             &ready.model.to_string_lossy(),
-            "-f",
+            "--output_file",
             &output.to_string_lossy(),
             "--sentence_silence",
             "0.12",
-            "--input_file",
-            &input.to_string_lossy(),
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
+        .spawn()
         .map_err(|error| error.to_string())?;
-    let _ = fs::remove_file(&input);
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| "piper stdin".to_string())?;
+        stdin
+            .write_all(trimmed.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stdin.write_all(b"\n").map_err(|error| error.to_string())?;
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
     if !status.success() || !output.is_file() {
         let _ = fs::remove_file(&output);
         return Err("piper failed".into());
