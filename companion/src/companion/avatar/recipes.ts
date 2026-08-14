@@ -31,7 +31,7 @@ const surface = (
   width: number,
   height: number,
   depth: number,
-  extras: Partial<SurfaceConfig> = {}
+  extras: Partial<Omit<SurfaceConfig, 'type' | 'width' | 'height' | 'depth'>> = {}
 ): SurfaceConfig => ({
   type,
   width,
@@ -39,7 +39,6 @@ const surface = (
   depth,
   roundness: extras.roundness ?? 1,
   ...extras,
-  type,
 })
 
 const accessory = (
