@@ -6,6 +6,12 @@ import {
   hasAmbientMotion,
 } from '@avatar-lab/features/avatar/ambientMotion'
 import {
+  applyEyeLook,
+  eyeShapeForLook,
+  gazeFollowsEyeLook,
+  type EyeLookId,
+} from '@avatar-lab/features/avatar/eyeLooks'
+import {
   expressionFields,
   poseFromExpression,
   renderAvatar,
@@ -44,10 +50,19 @@ export type GazeRenderOptions = {
   dizzy?: boolean
 }
 
+export type CompanionColorOverride = {
+  body?: string
+  eyes?: string
+}
+
 export type CompanionRuntime = {
   element: SVGSVGElement
   setSequence: (sequenceId: string) => void
+  setExpression: (expressionId: string) => void
+  setColors: (override: CompanionColorOverride | null) => void
+  setAvatar: (next: StudioAvatar) => void
   setGaze: (gaze: GazePoint, options?: GazeRenderOptions) => void
+  setEyeLook: (look: EyeLookId | null) => void
   setAmbientStrength: (value: number) => void
   destroy: () => void
 }
@@ -127,15 +142,16 @@ export const mountCompanionAvatar = (
     globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
   const clipId = `companion-clip-${instanceId}`
 
+  let currentAvatar = avatar
   const svg = svgElement('svg')
   svg.setAttribute('viewBox', '-150 -150 300 300')
   svg.setAttribute('role', 'img')
-  svg.setAttribute('aria-label', avatar.name)
+  svg.setAttribute('aria-label', currentAvatar.name)
   svg.style.width = `${size}px`
   svg.style.height = `${size}px`
   svg.style.display = 'block'
   svg.style.overflow = 'visible'
-  svg.style.pointerEvents = 'auto'
+  svg.style.pointerEvents = 'none'
 
   const defs = svgElement('defs')
   const clipPath = svgElement('clipPath')
@@ -169,9 +185,11 @@ export const mountCompanionAvatar = (
     })
   }
 
+  let colorOverride: CompanionColorOverride | null = null
+
   const resolveColors = (expression: Expression): Colors => ({
-    body: expression.bodyColor || avatar.colors.body,
-    eyes: expression.eyeColor || avatar.colors.eyes,
+    body: colorOverride?.body || expression.bodyColor || currentAvatar.colors.body,
+    eyes: colorOverride?.eyes || expression.eyeColor || currentAvatar.colors.eyes,
   })
 
   const idleSequence = sequences.get('idle') ?? behavior.sequences[0]
@@ -180,7 +198,7 @@ export const mountCompanionAvatar = (
   let currentSequence = idleSequence
   let currentExpression = applyAvatarEyeDefaults(
     expressions.get(idleSequence.steps[0]?.expressionId ?? '') ?? behavior.expressions[0],
-    avatar.eyes
+    currentAvatar.eyes
   )
   let currentColors = resolveColors(currentExpression)
   let blinkAmount = 1
@@ -203,6 +221,7 @@ export const mountCompanionAvatar = (
   let bodyAmbientStartedAt = performance.now()
   let eyeAmbientSignature = currentExpression.eyeMotion
   let bodyAmbientSignature = currentExpression.bodyMotion
+  let eyeLook: EyeLookId | null = 'neutral'
   let destroyed = false
 
   const applyAttentionPose = (expression: Expression, time: number): Expression => {
@@ -222,7 +241,7 @@ export const mountCompanionAvatar = (
         headX: gaze.y * HEAD_PITCH_DEG,
       }
     }
-    if (speaking) {
+    if (speaking && gazeFollowsEyeLook(eyeLook)) {
       const pulse = 1 + Math.sin((time - speakingStartedAt) / 90) * 0.08
       next = {
         ...next,
@@ -244,8 +263,12 @@ export const mountCompanionAvatar = (
     }
   }
 
-  const posedExpression = (expression: Expression): Expression =>
-    dizzy ? { ...expression, bodyMotion: 'shake', eyeMotion: 'shake' } : expression
+  const posedExpression = (expression: Expression): Expression => {
+    const next: Expression = dizzy
+      ? { ...expression, bodyMotion: 'shake', eyeMotion: 'shake' }
+      : expression
+    return eyeLook ? applyEyeLook(next, eyeLook) : next
+  }
 
   const render = (time = performance.now()) => {
     const source = posedExpression(currentExpression)
@@ -257,15 +280,19 @@ export const mountCompanionAvatar = (
         ? applyAmbientBodyMotion(source, bodyElapsed, ambientStrength)
         : source
     const attentive = applyAttentionPose(expression, time)
-    const eyeOffset = ambientEyeOffset(source, eyeElapsed, ambientStrength)
+    const followGaze = gazeFollowsEyeLook(eyeLook)
+    const eyeOffset = followGaze
+      ? ambientEyeOffset(source, eyeElapsed, ambientStrength)
+      : { x: 0, y: 0 }
     const pose = poseFromExpression(attentive)
-    const geometry = renderAvatar(pose, avatar.body.primary, blinkAmount, {
+    const geometry = renderAvatar(pose, currentAvatar.body.primary, blinkAmount, {
       includeWire: false,
-      bodyNodes: avatar.body.nodes,
+      bodyNodes: currentAvatar.body.nodes,
       eyeOffset: {
-        x: eyeOffset.x + gaze.x * EYE_TRAVEL.x,
-        y: eyeOffset.y + gaze.y * EYE_TRAVEL.y,
+        x: eyeOffset.x + (followGaze ? gaze.x * EYE_TRAVEL.x : 0),
+        y: eyeOffset.y + (followGaze ? gaze.y * EYE_TRAVEL.y : 0),
       },
+      eyeShape: eyeLook ? eyeShapeForLook(eyeLook) : 'rounded',
     })
     const offset = ambientBodyOffset(source, bodyElapsed, ambientStrength)
     motionLayer.setAttribute('transform', `translate(${offset.x} ${offset.y})`)
@@ -344,7 +371,10 @@ export const mountCompanionAvatar = (
   const animateTo = (expressionId: string, durationMs: number, transition: SequenceTransition) => {
     const raw = expressions.get(expressionId)
     if (!raw) return
-    const target = applyAvatarEyeDefaults(resolvedTarget(raw, currentExpression), avatar.eyes)
+    const target = applyAvatarEyeDefaults(
+      resolvedTarget(raw, currentExpression),
+      currentAvatar.eyes
+    )
     applyMotionSignature(target, performance.now())
     const targetColors = resolveColors(target)
     if (durationMs <= 0) {
@@ -429,6 +459,33 @@ export const mountCompanionAvatar = (
       if (!next || next.id === currentSequence.id) return
       playSequence(next)
     },
+    setExpression(expressionId: string) {
+      if (!expressions.has(expressionId)) return
+      clearSchedule()
+      animateTo(expressionId, 220, 'smooth')
+    },
+    setColors(override: CompanionColorOverride | null) {
+      colorOverride = override
+      const source = transitionState?.to ?? currentExpression
+      const target = resolveColors(source)
+      if (transitionState) {
+        transitionState.fromColors = target
+        transitionState.toColors = target
+      }
+      currentColors = target
+      if (frameRequest === null) render()
+    },
+    setAvatar(next: StudioAvatar) {
+      currentAvatar = next
+      svg.setAttribute('aria-label', next.name)
+      const source = transitionState?.to ?? currentExpression
+      const raw = expressions.get(source.id)
+      transitionState = null
+      if (raw) currentExpression = applyAvatarEyeDefaults(raw, currentAvatar.eyes)
+      currentColors = resolveColors(currentExpression)
+      if (frameRequest === null) render()
+      if (hasAmbientMotion(posedExpression(currentExpression))) requestTick()
+    },
     setGaze(next: GazePoint, options?: GazeRenderOptions) {
       gaze = next
       if (options?.followHead !== undefined) followHead = options.followHead
@@ -447,6 +504,15 @@ export const mountCompanionAvatar = (
       }
       if (frameRequest === null) render()
       if (speaking || dizzy) requestTick()
+    },
+    setEyeLook(next: EyeLookId | null) {
+      if (next === eyeLook) return
+      eyeLook = next
+      const now = performance.now()
+      eyeAmbientStartedAt = now
+      if (next) applyMotionSignature(applyEyeLook(currentExpression, next), now)
+      if (frameRequest === null) render()
+      if (gazeFollowsEyeLook(next) || speaking || dizzy) requestTick()
     },
     setAmbientStrength(value: number) {
       ambientStrength = clamp01(value)

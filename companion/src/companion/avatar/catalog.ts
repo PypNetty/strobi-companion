@@ -9,15 +9,16 @@ import {
   parseStudioDocument,
   type StudioDocument,
 } from '@avatar-lab/features/studio/studioDocument'
+import { avatarFromRecipe, creatureRecipes } from './recipes'
 
 const snapshot = defaultStudioDocument as StudioDocument
 
 export const loadBundledDocument = (): StudioDocument => parseStudioDocument(snapshot, snapshot)
 
-export const companionAvatar = (document: StudioDocument): StudioAvatar =>
-  document.library.avatars.find(avatar => avatar.id === 'strobi') ?? document.library.avatars[0]
+export const companionAvatar = (_document?: StudioDocument): StudioAvatar =>
+  avatarFromRecipe(creatureRecipes.strobi)
 
-export const bundledAvatarName = companionAvatar(snapshot).name
+export const bundledAvatarName = companionAvatar().name
 
 export const companionBehavior = (
   document: StudioDocument,

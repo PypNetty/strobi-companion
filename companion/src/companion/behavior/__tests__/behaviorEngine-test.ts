@@ -80,6 +80,14 @@ describe('BehaviorEngine', () => {
     expect(engine.state).toBe('watching')
   })
 
+  it('treats a moving mouse as presence', () => {
+    const { engine, advance } = createEngine()
+    engine.dispatch({ type: 'CURSOR_MOVED' })
+    expect(engine.state).toBe('curious')
+    advance(2_000)
+    expect(engine.state).toBe('watching')
+  })
+
   it('wakes from sleep when a local voice is heard', () => {
     const { engine, advance } = createEngine()
     engine.dispatch({ type: 'FACE_DETECTED', x: 0, y: 0 })

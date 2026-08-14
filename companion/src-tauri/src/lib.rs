@@ -6,13 +6,11 @@ mod speech;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Manager, PhysicalPosition};
+use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize};
 
 #[derive(Serialize, Deserialize, Default)]
 struct WindowPosition {
@@ -47,6 +45,42 @@ fn restore_position(app: &tauri::AppHandle) -> Option<PhysicalPosition<i32>> {
     let json = fs::read_to_string(path).ok()?;
     let payload: WindowPosition = serde_json::from_str(&json).ok()?;
     Some(PhysicalPosition::new(payload.x, payload.y))
+}
+
+fn clamp_to_visible(
+    window: &tauri::WebviewWindow,
+    position: PhysicalPosition<i32>,
+) -> PhysicalPosition<i32> {
+    let Ok(monitors) = window.available_monitors() else {
+        return position;
+    };
+    let size = window
+        .outer_size()
+        .unwrap_or(PhysicalSize::new(280, 320));
+    let width = size.width as i32;
+    let height = size.height as i32;
+    let on_screen = monitors.iter().any(|monitor| {
+        let origin = monitor.position();
+        let area = monitor.size();
+        let right = origin.x + area.width as i32;
+        let bottom = origin.y + area.height as i32;
+        position.x + width > origin.x
+            && position.x < right
+            && position.y + height > origin.y
+            && position.y < bottom
+    });
+    if on_screen {
+        return position;
+    }
+    if let Ok(Some(primary)) = window.primary_monitor() {
+        let origin = primary.position();
+        let area = primary.size();
+        return PhysicalPosition::new(
+            origin.x + (area.width as i32 - width).max(0) / 2,
+            origin.y + (area.height as i32 - height).max(0) / 2,
+        );
+    }
+    position
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
@@ -107,7 +141,7 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("companion") {
                 if let Some(position) = restore_position(app.handle()) {
-                    let _ = window.set_position(position);
+                    let _ = window.set_position(clamp_to_visible(&window, position));
                 }
             }
 
@@ -150,13 +184,6 @@ pub fn run() {
             }
 
             tray.build(app)?;
-
-            let handle = app.handle().clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(900));
-                let engine = handle.state::<speech::SpeechEngine>();
-                let _ = engine.speak("Coucou, je suis Strobi.".to_string());
-            });
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -80,7 +80,8 @@ export class BehaviorEngine {
         this.onFaceDetected(now, this.lastFaceX, this.lastFaceY)
         break
       case 'VOICE_DETECTED':
-        this.onVoiceDetected(now)
+      case 'CURSOR_MOVED':
+        this.onSoftPresence(now)
         break
       case 'FACE_LOST':
       case 'USER_IDLE':
@@ -134,7 +135,7 @@ export class BehaviorEngine {
     )
   }
 
-  private onVoiceDetected(now: number) {
+  private onSoftPresence(now: number) {
     this.lastHeardAt = now
     this.lastLostAt = null
     if (this.current === 'sleeping') {

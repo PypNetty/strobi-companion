@@ -19,6 +19,18 @@ export type NativeListenerOptions = {
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
+export const shouldAckHeardVoice = (input: {
+  listening: boolean
+  listenFailed: boolean
+  speaking: boolean
+  answering: boolean
+  missedVad: number
+}) => {
+  if (input.speaking || input.answering) return false
+  if (!input.listening || input.listenFailed) return true
+  return input.missedVad >= 3
+}
+
 export class NativeListener {
   private unlisten: Array<() => void> = []
   private running = false
@@ -34,19 +46,31 @@ export class NativeListener {
         import('@tauri-apps/api/event'),
         import('@tauri-apps/api/core'),
       ])
-      this.unlisten.push(
-        await listen<TranscriptPayload>('companion://transcript', event => {
-          if (event.payload?.text) options.onTranscript(event.payload)
-        })
-      )
-      this.unlisten.push(
-        await listen('companion://speech-start', () => options.onSpeechStart?.())
-      )
-      this.unlisten.push(
-        await listen<VoiceStack>('companion://voice-stack', event => {
-          if (event.payload) options.onStack?.(event.payload)
-        })
-      )
+      if (this.unlisten.length === 0) {
+        this.unlisten.push(
+          await listen<TranscriptPayload>('companion://transcript', event => {
+            if (event.payload?.text) options.onTranscript(event.payload)
+          })
+        )
+        this.unlisten.push(
+          await listen('companion://speech-start', () => options.onSpeechStart?.())
+        )
+        this.unlisten.push(
+          await listen<VoiceStack>('companion://voice-stack', event => {
+            if (event.payload) options.onStack?.(event.payload)
+          })
+        )
+        this.unlisten.push(
+          await listen<string>('companion://listen-error', event => {
+            this.running = false
+            const message =
+              typeof event.payload === 'string' && event.payload.trim()
+                ? event.payload
+                : 'Écoute locale indisponible. Rien n’est envoyé.'
+            options.onError?.(message)
+          })
+        )
+      }
       await invoke('start_listening')
       this.running = true
       try {
