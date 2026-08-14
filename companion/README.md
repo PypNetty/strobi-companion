@@ -1,8 +1,10 @@
-# Desktop Companion
+# Strobi
 
-Petit compagnon Windows local. Il vit sur le bureau, cligne des yeux, s’endort si personne n’est là, et regarde approximativement vers vous via un face tracking **100 % local**.
+Petit compagnon Windows. Elle vit sur le bureau, détecte ta présence en local, te regarde, et peut répondre à voix haute.
 
-Ce n’est pas le Studio d’édition. L’application consomme le moteur procédural déjà présent dans `src/features/` (géométrie, expressions, animations, clignements, mouvement ambient, `eyeOffset`).
+Ce n’est pas le Studio d’édition. L’application dans ce dossier consomme le moteur SVG déjà présent à la racine du dépôt (`src/features/avatar/`), sans l’interface Avatar Lab.
+
+Le README du dépôt décrit le produit. Ici : comment lancer l’app.
 
 ## Lancer
 
@@ -21,7 +23,7 @@ pnpm test
 pnpm tauri:dev
 ```
 
-Le premier `pnpm install` copie le runtime WASM MediaPipe et télécharge le modèle Face Landmarker en local (`public/models/`). Aucune frame webcam n’est envoyée ni stockée.
+Le premier `pnpm install` copie le runtime WASM MediaPipe et télécharge le modèle Face Landmarker (`public/models/`). Piper télécharge la voix `fr_FR-siwis-medium` dans `models/` au premier usage. Aucune frame webcam ni audio n’est envoyé.
 
 Sans la chaîne C++ Windows, tu peux déjà prévisualiser le personnage dans le navigateur :
 
@@ -31,25 +33,27 @@ pnpm dev
 
 Ouvre [http://localhost:1420](http://localhost:1420). Le fond transparent, le tray et `always_on_top` nécessitent `pnpm tauri:dev`.
 
+Ferme le Studio (`pnpm dev` à la racine) tant que Strobi utilise la caméra.
+
 ## Tray
 
 - Afficher / masquer
 - Activer / désactiver le face tracking
+- Activer / désactiver la voix
 - Quitter
 
-La caméra peut aussi être coupée immédiatement depuis le bandeau qui apparaît au survol.
+La caméra peut aussi être coupée depuis le bandeau au survol.
 
 ## Architecture
 
 ```text
 Webcam → Face Landmarker → Perception → Behavior Engine → Gaze Controller → Avatar runtime SVG
+Micro → reconnaissance locale → intents (et Ollama si installé) → Piper / SAPI
 ```
 
-Le tracker ne déplace pas les pupilles. Il publie seulement une présence et une position normalisée `-1…1`. Le regard est lissé, avec inertie, délai de réaction et regards ailleurs occasionnels. Déplacer la fenêtre (glisser le compagnon) oriente le regard dans le sens du mouvement, puis le curseur et le visage sont recalculés par rapport à la nouvelle position écran.
+Le tracker ne déplace pas les pupilles. Il publie une présence et une position `-1…1`. Le regard est lissé (souris > visage > idle). Un drag oriente le regard ; une secousse la rend étourdie.
 
-La voix est 100 % locale (`speechSynthesis` + micro). Le webview peut bloquer la synthèse tant qu’il n’y a pas eu de clic : le premier clic sur le compagnon débloque la voix. Les répliques sont rares (salut, présence, déplacement, micro) avec un cooldown, sans file d’attente bavarde.
-
-La logique de comportement est testable sans caméra et sans renderer :
+La logique de comportement, du regard et des intents est testable sans caméra :
 
 ```bash
 pnpm test
