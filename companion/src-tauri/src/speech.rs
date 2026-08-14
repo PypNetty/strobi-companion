@@ -48,12 +48,19 @@ try {
         $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
       }
       $path = [Text.Encoding]::UTF8.GetString($bytes)
+      $played = $false
       try {
-        Add-Type -AssemblyName System.Media
-        $script:player = New-Object System.Media.SoundPlayer $path
+        $script:player = New-Object System.Media.SoundPlayer
+        $script:player.SoundLocation = $path
+        $script:player.Load()
         $script:player.PlaySync()
+        $played = $true
       } catch {}
-      [Console]::Out.WriteLine('ok')
+      if ($played) {
+        [Console]::Out.WriteLine('ok')
+      } else {
+        [Console]::Out.WriteLine('err')
+      }
       [Console]::Out.Flush()
       continue
     }
@@ -269,6 +276,7 @@ impl Worker {
         loop {
             match self.lines.recv_timeout(timeout) {
                 Ok(line) if line.eq_ignore_ascii_case("ok") => return Ok(()),
+                Ok(line) if line.eq_ignore_ascii_case("err") => return Err("tts play failed".into()),
                 Ok(_) => continue,
                 Err(RecvTimeoutError::Timeout) => return Err("tts timeout".into()),
                 Err(RecvTimeoutError::Disconnected) => return Err("tts worker exited".into()),
