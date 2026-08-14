@@ -58,10 +58,13 @@ export type AvatarGeometry = {
   wirePaths: string[]
 }
 
+export type EyeShape = 'rounded' | 'happyArc'
+
 export type RenderAvatarOptions = {
   includeWire?: boolean
   bodyNodes?: BodyNode[]
   eyeOffset?: Readonly<{ x: number; y: number }>
+  eyeShape?: EyeShape
 }
 
 export type EyeEditorGeometry = {
@@ -549,12 +552,35 @@ const projectFacePoint = (
   return projectLocalSurfacePoint(pose, surfaceFrontSampleAt(surface, faceX, faceY))
 }
 
+const happyArc = (width: number, height: number): (readonly [number, number])[] => {
+  const outerRx = width / 2
+  const outerRy = height / 2
+  const thickness = Math.min(width, height) * 0.42
+  const innerRx = Math.max(1, outerRx - thickness)
+  const innerRy = Math.max(1, outerRy - thickness)
+  const samples = 16
+  const points: (readonly [number, number])[] = []
+  for (let index = 0; index <= samples; index += 1) {
+    const angle = Math.PI - (index / samples) * Math.PI
+    points.push([Math.cos(angle) * outerRx, -Math.sin(angle) * outerRy])
+  }
+  for (let index = 0; index <= samples; index += 1) {
+    const angle = (index / samples) * Math.PI
+    points.push([Math.cos(angle) * innerRx, -Math.sin(angle) * innerRy])
+  }
+  return points
+}
+
+const eyeOutline = (width: number, height: number, shape: EyeShape) =>
+  shape === 'happyArc' ? happyArc(width, height) : roundedRectangle(width, height)
+
 const eyePoints = (
   pose: AvatarPose,
   surface: SurfaceConfig,
   side: -1 | 1,
   blink: number,
-  offset: Readonly<{ x: number; y: number }> = { x: 0, y: 0 }
+  offset: Readonly<{ x: number; y: number }> = { x: 0, y: 0 },
+  shape: EyeShape = 'rounded'
 ): ProjectedSurfacePoint[] => {
   const expression = pose.expression
   const suffix = side < 0 ? 'Left' : 'Right'
@@ -564,7 +590,7 @@ const eyePoints = (
   const centerX = (side * expression.spacing) / 2 + expression[`positionX${suffix}`] + offset.x
   const centerY = expression[`positionY${suffix}`] + offset.y
   const angle = radians(side < 0 ? expression.leftAngle : expression.rightAngle)
-  return roundedRectangle(width, height).map(([localX, localY]) => {
+  return eyeOutline(width, height, shape).map(([localX, localY]) => {
     const rotatedX = localX * Math.cos(angle) - localY * Math.sin(angle)
     const rotatedY = localX * Math.sin(angle) + localY * Math.cos(angle)
     return projectFacePoint(pose, surface, centerX + rotatedX, centerY + rotatedY)
@@ -1232,8 +1258,9 @@ export const renderAvatar = (
   blink = 1,
   options: RenderAvatarOptions = {}
 ): AvatarGeometry => {
-  const leftSamples = eyePoints(pose, surface, -1, blink, options.eyeOffset)
-  const rightSamples = eyePoints(pose, surface, 1, blink, options.eyeOffset)
+  const eyeShape = options.eyeShape ?? 'rounded'
+  const leftSamples = eyePoints(pose, surface, -1, blink, options.eyeOffset, eyeShape)
+  const rightSamples = eyePoints(pose, surface, 1, blink, options.eyeOffset, eyeShape)
   const left = leftSamples.map(sample => sample.point)
   const right = rightSamples.map(sample => sample.point)
   const accessories = accessoryLayers(pose, options.bodyNodes ?? [])

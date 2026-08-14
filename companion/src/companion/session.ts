@@ -1,4 +1,5 @@
 import { BehaviorEngine } from './behavior/behaviorEngine'
+import { PresenceBody } from './behavior/presenceBody'
 import type { CompanionState } from './behavior/companionState'
 import { GazeController, shouldFollowHead, type PointerGaze } from './gaze/gazeController'
 import { CursorTracker } from './gaze/cursorTracker'
@@ -10,16 +11,24 @@ import {
   loadBundledDocument,
   sequenceIdForState,
 } from './avatar/catalog'
+import { avatarFromRecipe, creatureRecipes } from './avatar/recipes'
+import { eyeLookForCompanion, type EyeLookId } from './avatar/eyeLookMapping'
 import { mountCompanionAvatar, type CompanionRuntime } from './avatar/runtime'
 import { CompanionSpeech } from './voice/speech'
 import { VoiceActivityDetector } from './voice/activity'
-import { askLocalBrain, NativeListener, type VoiceStack } from './voice/listen'
+import { askLocalBrain, NativeListener, shouldAckHeardVoice, type VoiceStack } from './voice/listen'
 import {
   classifyIntent,
+  colorOverrideFor,
   formatLocalTime,
   isLikelyEcho,
-  replyFromUtterance,
+  replyForIntent,
+  sequenceIdForMood,
+  type CompanionIntent,
+  type MoodName,
 } from './voice/intents'
+import { pickSpeechLine } from './voice/lines'
+import { applyPresenceWindow } from './window/presenceWindow'
 
 export type CompanionStatus = {
   state: CompanionState
@@ -34,8 +43,10 @@ export type CompanionStatus = {
   brainModel?: string | null
   cameraLabel?: string
   cameraPreferred?: boolean
+  expanded: boolean
   localOnly: true
   error?: string
+  listenError?: string
 }
 
 export type CompanionSessionOptions = {
@@ -48,6 +59,7 @@ const watchingGapMs = () => 10_000 + Math.floor(Math.random() * 8_000)
 
 export class CompanionSession {
   private engine = new BehaviorEngine()
+  private presence = new PresenceBody()
   private gaze = new GazeController()
   private cursor = new CursorTracker()
   private perception: PerceptionState = emptyPerception()
@@ -83,6 +95,14 @@ export class CompanionSession {
   private dragSpoken = false
   private shakeSpoken = false
   private nextWatchingSpeechAt = 0
+  private skipReactionForGreeting = false
+  private greetedUntil = 0
+  private moodSequence: string | null = null
+  private mood: MoodName | null = null
+  private lastEyeLook: EyeLookId | null = 'neutral'
+  private listenError?: string
+  private missedVad = 0
+  private lastListenRetry = 0
 
   constructor(host: HTMLElement, options: CompanionSessionOptions = {}) {
     this.onStatus = options.onStatus
@@ -141,12 +161,14 @@ export class CompanionSession {
       await this.listener.stop()
       this.listening = false
       this.speaking = false
+      this.listenError = undefined
+      this.missedVad = 0
       this.emitStatus()
       return
     }
     this.unlockInteraction()
-    await this.ensureVoice()
     await this.ensureListener()
+    await this.ensureVoice()
     this.emitStatus()
   }
 
@@ -161,23 +183,23 @@ export class CompanionSession {
     }
     if (this.tracking) await this.ensureTracker()
     if (this.voiceEnabled) {
-      await this.ensureVoice()
       await this.ensureListener()
+      await this.ensureVoice()
     }
   }
 
   setPointer(pointer: PointerGaze) {
     if (isTauri()) return
     this.pointer = pointer
+    if (pointer.active) this.noticePresence()
   }
 
   unlockInteraction() {
-    const first = !this.speech.isUnlocked
-    if (this.voiceEnabled && first && !this.speech.hasQueued) this.speech.speak('greeting')
+    this.noticePresence()
     this.speech.unlock()
     void this.voiceDetector?.resume()
-    if (this.voiceEnabled && !this.voiceDetector?.active) void this.ensureVoice()
     if (this.voiceEnabled) void this.ensureListener()
+    if (this.voiceEnabled && !this.voiceDetector?.active) void this.ensureVoice()
     this.emitStatus()
   }
 
@@ -185,9 +207,8 @@ export class CompanionSession {
     const generation = ++this.startGeneration
     await this.cursor.start()
     if (this.tracking) await this.ensureTracker()
-    if (this.voiceEnabled) await this.ensureVoice()
     if (this.voiceEnabled) await this.ensureListener()
-    if (this.voiceEnabled) this.speech.speak('greeting')
+    if (this.voiceEnabled) await this.ensureVoice()
     if (generation !== this.startGeneration || this.destroyed) {
       await this.tracker?.stop()
       await this.voiceDetector?.stop()
@@ -235,8 +256,24 @@ export class CompanionSession {
       onVoice: () => {
         this.voicePresentUntil = Date.now() + 1_600
         this.engine.dispatch({ type: 'VOICE_DETECTED' })
-        if (this.speaking) this.speech.cancel()
-        if (!this.listening) this.speech.speak('heard')
+        const grew = this.noticePresence()
+        if (!grew) {
+          if (this.speaking) this.speech.cancel()
+          this.missedVad += 1
+          if (
+            shouldAckHeardVoice({
+              listening: this.listening,
+              listenFailed: Boolean(this.listenError),
+              speaking: this.speaking,
+              answering: this.answering,
+              missedVad: this.missedVad,
+            })
+          ) {
+            this.missedVad = 0
+            this.speech.speak('heard')
+            if (!this.listener.active) void this.ensureListener()
+          }
+        }
         this.syncRuntime()
         this.emitStatus()
       },
@@ -255,16 +292,19 @@ export class CompanionSession {
       onSpeechStart: () => {
         this.voicePresentUntil = Date.now() + 1_800
         this.engine.dispatch({ type: 'VOICE_DETECTED' })
+        this.noticePresence()
         if (this.speaking) this.speech.cancel()
         this.syncRuntime()
       },
       onStack: stack => this.onVoiceStack(stack),
       onError: message => {
-        this.error = this.error ?? message
+        this.listenError = message
+        this.listening = false
         this.emitStatus()
       },
     })
     this.listening = started
+    if (started) this.listenError = undefined
     this.emitStatus()
   }
 
@@ -279,8 +319,12 @@ export class CompanionSession {
   private onTranscript(text: string) {
     if (!this.voiceEnabled || this.destroyed) return
     if (isLikelyEcho(text, this.lastSpoken)) return
+    this.listenError = undefined
+    this.missedVad = 0
+    this.listening = true
     this.voicePresentUntil = Date.now() + 2_400
     this.engine.dispatch({ type: 'VOICE_DETECTED' })
+    this.noticePresence()
     void this.replyTo(text)
   }
 
@@ -290,9 +334,9 @@ export class CompanionSession {
     this.speech.cancel()
     try {
       const intent = classifyIntent(text)
-      let reply =
-        intent === 'unknown' ? await askLocalBrain(text, formatLocalTime()) : ''
-      if (!reply) reply = replyFromUtterance(text)
+      this.applyAppearance(intent)
+      let reply = intent.type === 'unknown' ? await askLocalBrain(text, formatLocalTime()) : ''
+      if (!reply) reply = replyForIntent(intent)
       this.lastSpoken = reply
       this.speech.speakText(reply)
     } finally {
@@ -314,6 +358,7 @@ export class CompanionSession {
     } else {
       this.engine.dispatch({ type: 'FACE_LOST' })
     }
+    this.noticePresenceFromFace(state.faceDetected)
     this.tracker?.setReducedRate(this.engine.state === 'sleeping')
     this.syncRuntime()
     this.emitStatus()
@@ -324,13 +369,28 @@ export class CompanionSession {
     if (time - this.lastEngineTick >= 250) {
       this.engine.dispatch({ type: 'TICK' })
       this.lastEngineTick = time
+      if (
+        this.voiceEnabled &&
+        !this.suspended &&
+        !this.listener.active &&
+        time - this.lastListenRetry >= 4_000
+      ) {
+        this.lastListenRetry = time
+        void this.ensureListener()
+      }
     }
     const motion = this.cursor.motionGaze(Date.now())
     const pollMs = motion.active || motion.shaking ? 32 : 80
     if (time - this.lastCursorPoll >= pollMs) {
       this.lastCursorPoll = time
       void this.cursor.sample(Date.now()).then(sample => {
-        if (sample && !this.destroyed) this.pointer = sample.pointer
+        if (sample && !this.destroyed) {
+          this.pointer = sample.pointer
+          if (sample.pointer.active) {
+            this.engine.dispatch({ type: 'CURSOR_MOVED' })
+            this.noticePresence()
+          }
+        }
       })
     }
     this.syncRuntime()
@@ -340,11 +400,18 @@ export class CompanionSession {
   private syncRuntime() {
     const state = this.engine.state
     if (state !== this.lastState) {
-      this.runtime.setSequence(sequenceIdForState(state))
-      if (state === 'waking') this.speech.speak('waking')
-      if (state === 'curious') this.speech.speak('curious')
-      if (state === 'idle') this.speech.speak('idle')
-      if (state === 'sleeping') this.speech.speak('sleeping')
+      if (state === 'sleeping' || state === 'waking') {
+        this.moodSequence = null
+        this.mood = null
+      }
+      this.runtime.setSequence(this.moodSequence ?? sequenceIdForState(state))
+      if (state === 'waking') this.speakUnlessGreeting('waking')
+      if (state === 'curious') this.speakUnlessGreeting('curious')
+      if (state === 'idle') this.restPresence()
+      if (state === 'sleeping') {
+        this.speech.speak('sleeping')
+        this.restPresence()
+      }
       if (state === 'watching') this.nextWatchingSpeechAt = Date.now() + watchingGapMs()
       this.lastState = state
       this.emitStatus()
@@ -363,6 +430,15 @@ export class CompanionSession {
     this.refreshAttentionCues(motion)
     const voicePresent = now < this.voicePresentUntil
     const gaze = this.gaze.update(this.perception, this.pointer, state, voicePresent, motion)
+    const eyeLook = eyeLookForCompanion({
+      state,
+      mood: this.mood,
+      gazeX: gaze.x,
+      heard: voicePresent,
+      previous: this.lastEyeLook,
+    })
+    this.lastEyeLook = eyeLook
+    this.runtime.setEyeLook(eyeLook)
     this.runtime.setGaze(gaze, {
       followHead: shouldFollowHead(this.pointer, this.perception, state, voicePresent, motion),
       speaking: this.speaking,
@@ -371,6 +447,13 @@ export class CompanionSession {
   }
 
   private refreshAttentionCues(motion: PointerGaze) {
+    if (motion.shaking || motion.active) this.noticePresence()
+    if (Date.now() < this.greetedUntil) {
+      this.dragSpoken = true
+      this.shakeSpoken = true
+      this.pointerWasActive = this.pointer.active
+      return
+    }
     if (motion.shaking) {
       if (!this.shakeSpoken) {
         this.speech.speak('shaken')
@@ -390,6 +473,72 @@ export class CompanionSession {
     this.pointerWasActive = this.pointer.active
   }
 
+  private noticePresenceFromFace(faceDetected: boolean) {
+    if (faceDetected) this.noticePresence()
+  }
+
+  private noticePresence() {
+    if (!this.presence.notice()) return false
+    this.skipReactionForGreeting = true
+    this.greetedUntil = Date.now() + 2_400
+    if (this.voiceEnabled) {
+      const hello = pickSpeechLine('greeting')
+      if (hello) {
+        this.lastSpoken = hello
+        this.speech.speakText(hello)
+      }
+    }
+    void applyPresenceWindow(true)
+    this.emitStatus()
+    return true
+  }
+
+  private restPresence() {
+    if (!this.presence.rest()) return
+    this.skipReactionForGreeting = false
+    void applyPresenceWindow(false)
+    this.emitStatus()
+  }
+
+  private applyAppearance(intent: CompanionIntent) {
+    if (intent.type === 'color') {
+      this.runtime.setColors(colorOverrideFor(intent.color))
+      return
+    }
+    if (intent.type === 'colorReset') {
+      this.runtime.setColors(null)
+      return
+    }
+    if (intent.type === 'shape') {
+      this.runtime.setAvatar(avatarFromRecipe(creatureRecipes[intent.recipe]))
+      return
+    }
+    if (intent.type === 'shapeReset') {
+      this.runtime.setAvatar(avatarFromRecipe(creatureRecipes.strobi))
+      this.runtime.setColors(null)
+      return
+    }
+    if (intent.type === 'mood') {
+      this.mood = intent.mood
+      this.moodSequence = sequenceIdForMood(intent.mood)
+      this.runtime.setSequence(this.moodSequence)
+      return
+    }
+    if (intent.type === 'sleep') {
+      this.mood = null
+      this.moodSequence = null
+      this.runtime.setSequence(sequenceIdForState(this.engine.state))
+    }
+  }
+
+  private speakUnlessGreeting(cue: 'waking' | 'curious') {
+    if (this.skipReactionForGreeting) {
+      this.skipReactionForGreeting = false
+      return
+    }
+    this.speech.speak(cue)
+  }
+
   private emitStatus() {
     const status: CompanionStatus = {
       state: this.engine.state,
@@ -404,8 +553,10 @@ export class CompanionSession {
       brainModel: this.brainModel,
       cameraLabel: this.cameraLabel,
       cameraPreferred: this.cameraPreferred,
+      expanded: this.presence.isFull,
       localOnly: true,
       error: this.error,
+      listenError: this.listenError,
     }
     const previous = this.lastStatus
     if (
@@ -422,7 +573,9 @@ export class CompanionSession {
       previous.brainModel === status.brainModel &&
       previous.cameraLabel === status.cameraLabel &&
       previous.cameraPreferred === status.cameraPreferred &&
-      previous.error === status.error
+      previous.expanded === status.expanded &&
+      previous.error === status.error &&
+      previous.listenError === status.listenError
     ) {
       return
     }

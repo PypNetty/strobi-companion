@@ -1,5 +1,5 @@
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useEffect, useRef, useState, type PointerEvent } from 'react'
-import { bundledAvatarName } from '../companion/avatar/catalog'
 import { CompanionSession, type CompanionStatus } from '../companion/session'
 
 const initialStatus: CompanionStatus = {
@@ -12,6 +12,7 @@ const initialStatus: CompanionStatus = {
   listening: false,
   ttsEngine: 'sapi',
   brain: 'keywords',
+  expanded: false,
   localOnly: true,
 }
 
@@ -59,14 +60,12 @@ export function App() {
     }
   }, [])
 
-  const onPointerDown = async (event: PointerEvent<HTMLDivElement>) => {
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return
-    const target = event.target as HTMLElement
-    if (target.closest('button')) return
+    if ((event.target as HTMLElement).closest('button')) return
     sessionRef.current?.unlockInteraction()
     if (!isTauri()) return
-    const { getCurrentWindow } = await import('@tauri-apps/api/window')
-    await getCurrentWindow().startDragging()
+    void getCurrentWindow().startDragging()
   }
 
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
@@ -84,82 +83,65 @@ export function App() {
     sessionRef.current?.setPointer({ active: false, x: 0, y: 0 })
   }
 
+  const cameraLabel = status.tracking ? 'Couper la caméra' : 'Activer la caméra'
+  const micLabel = status.voiceEnabled ? 'Couper le micro' : 'Activer le micro'
+  const listenCue = !status.voiceEnabled
+    ? 'is-off'
+    : status.listenError
+      ? 'is-error'
+      : status.listening
+        ? 'is-live'
+        : 'is-wait'
+
   return (
-    <main className="shell">
+    <main className={`shell ${status.expanded ? 'is-awake' : 'is-tiny'}`}>
       <div
         className="stage"
         ref={hostRef}
+        data-tauri-drag-region
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerLeave={onPointerLeave}
       />
-      <aside className="hud">
-        <p className="name">{bundledAvatarName}</p>
-        <p className="privacy">
-          Caméra, micro, voix et réponses 100% locaux — rien n’est envoyé ni enregistré.
-        </p>
-        {status.voiceEnabled && !status.voiceUnlocked && !isTauri() ? (
-          <p className="privacy">Clique sur le compagnon pour activer la voix.</p>
-        ) : null}
-        {status.cameraLabel ? (
-          <p className="camera">
-            {status.cameraPreferred
-              ? `Caméra : ${status.cameraLabel}`
-              : `Caméra : ${status.cameraLabel} — C920 introuvable`}
-          </p>
-        ) : null}
-        <div className="hud-row">
-          <span
-            className={`dot ${status.faceDetected ? 'on' : ''} ${status.tracking ? '' : 'off'}`}
-          />
-          <span className="state">{labelFor(status)}</span>
-          <button
-            type="button"
-            className="toggle"
-            onClick={() => void sessionRef.current?.setTracking(!status.tracking)}
-          >
-            {status.tracking ? 'Couper la caméra' : 'Activer la caméra'}
-          </button>
-        </div>
-        <div className="hud-row">
-          <span
-            className={`dot ${status.speaking ? 'on' : ''} ${status.voiceEnabled ? '' : 'off'}`}
-          />
-          <span className="state">
-            {status.voiceEnabled
-              ? status.listening
-                ? 'Écoute locale'
-                : 'Voix locale'
-              : 'Voix coupée'}
-          </span>
-          <button
-            type="button"
-            className="toggle"
-            onClick={() => void sessionRef.current?.setVoiceEnabled(!status.voiceEnabled)}
-          >
-            {status.voiceEnabled ? 'Couper la voix' : 'Activer la voix'}
-          </button>
-        </div>
-        {status.voiceEnabled ? (
-          <p className="camera">
-            {status.ttsEngine === 'piper' ? 'Voix neurale Piper' : 'Voix Windows (Piper en cours)'}
-            {status.brain === 'ollama' && status.brainModel
-              ? ` · ${status.brainModel}`
-              : ' · installe Ollama + llama3.2:1b pour plus de réponses'}
-          </p>
-        ) : null}
-        {status.error ? <p className="error">{status.error}</p> : null}
-      </aside>
+      <div className={`listen-cue ${listenCue}`} aria-hidden="true" />
+      <div className="controls" data-tauri-drag-region="false">
+        <button
+          type="button"
+          className={`icon-toggle ${status.tracking ? 'on' : 'off'}`}
+          aria-label={cameraLabel}
+          title={cameraLabel}
+          onPointerDown={event => event.stopPropagation()}
+          onClick={() => void sessionRef.current?.setTracking(!status.tracking)}
+        >
+          <CameraIcon off={!status.tracking} />
+        </button>
+        <button
+          type="button"
+          className={`icon-toggle ${status.voiceEnabled ? 'on' : 'off'}`}
+          aria-label={micLabel}
+          title={micLabel}
+          onPointerDown={event => event.stopPropagation()}
+          onClick={() => void sessionRef.current?.setVoiceEnabled(!status.voiceEnabled)}
+        >
+          <MicIcon off={!status.voiceEnabled} />
+        </button>
+      </div>
     </main>
   )
 }
 
-const labelFor = (status: CompanionStatus) => {
-  if (!status.tracking) return 'Caméra coupée'
-  if (status.error) return 'Caméra indisponible'
-  if (status.state === 'sleeping') return 'Endormi'
-  if (status.state === 'waking') return 'Réveil'
-  if (status.faceDetected) return 'Présence locale'
-  if (status.listening) return 'J’écoute'
-  return 'En attente'
-}
+const CameraIcon = ({ off }: { off: boolean }) => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h7A2.5 2.5 0 0 1 16 8.5v7a2.5 2.5 0 0 1-2.5 2.5h-7A2.5 2.5 0 0 1 4 15.5v-7Z" />
+    <path d="M16 10.2 20.2 8v8L16 13.8V10.2Z" />
+    {off ? <path d="M3 4.2 20.8 20" /> : null}
+  </svg>
+)
+
+const MicIcon = ({ off }: { off: boolean }) => (
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="9" y="3.5" width="6" height="10" rx="3" />
+    <path d="M7 11.5a5 5 0 0 0 10 0M12 16.5v3.2M9 20.2h6" />
+    {off ? <path d="M3 4.2 20.8 20" /> : null}
+  </svg>
+)

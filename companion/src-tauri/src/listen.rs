@@ -3,115 +3,249 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const HOST_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 const HOST_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Continue'
 [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 Add-Type -AssemblyName System.Speech
+Add-Type -AssemblyName System.Windows.Forms
 
-function Convert-Hex([string]$text) {
-  $bytes = [Text.Encoding]::UTF8.GetBytes($text)
-  -join ($bytes | ForEach-Object { $_.ToString('x2') })
+$ListenHostSource = @'
+using System;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Speech.Recognition;
+using System.Text;
+using System.Threading;
+
+public static class ListenHost {
+  static readonly ConcurrentQueue<string> Commands = new ConcurrentQueue<string>();
+  static readonly object Gate = new object();
+  static SpeechRecognitionEngine engine;
+  static volatile bool paused;
+  static volatile bool running;
+  static volatile bool quit;
+  static volatile bool needRestart;
+  public static volatile bool Finished;
+
+  public static string Boot() {
+    try {
+      var installed = SpeechRecognitionEngine.InstalledRecognizers();
+      if (installed == null || installed.Count == 0) return "E norecog";
+      RecognizerInfo chosen = null;
+      foreach (RecognizerInfo info in installed) {
+        if (info.Culture != null && info.Culture.Name.StartsWith("fr", StringComparison.OrdinalIgnoreCase)) {
+          chosen = info;
+          break;
+        }
+      }
+      if (chosen == null) chosen = installed[0];
+      engine = new SpeechRecognitionEngine(chosen);
+      try {
+        engine.SetInputToDefaultAudioDevice();
+      } catch {
+        return "E mic";
+      }
+      engine.BabbleTimeout = TimeSpan.FromSeconds(2);
+      engine.InitialSilenceTimeout = TimeSpan.FromSeconds(5);
+      engine.EndSilenceTimeout = TimeSpan.FromMilliseconds(650);
+      LoadGrammars(engine, chosen.Culture);
+      engine.SpeechDetected += (s, e) => Write("D");
+      engine.SpeechRecognized += (s, e) => {
+        if (e == null || e.Result == null) return;
+        if (e.Result.Confidence < 0.18f) return;
+        var text = e.Result.Text;
+        if (string.IsNullOrWhiteSpace(text)) return;
+        var conf = e.Result.Confidence.ToString("0.00", CultureInfo.InvariantCulture);
+        Write("R " + conf + " " + ToHex(text.Trim()));
+      };
+      engine.RecognizeCompleted += (s, e) => {
+        running = false;
+        if (!quit && !paused) needRestart = true;
+      };
+      StartStdinReader();
+      StartAsync();
+      return "ok";
+    } catch {
+      return "E start";
+    }
+  }
+
+  static void LoadGrammars(SpeechRecognitionEngine host, CultureInfo culture) {
+    var phrases = new Choices();
+    string[] list = {
+      "comment tu t'appelles", "qui es-tu", "qui es tu", "ca va", "ça va",
+      "comment ça va", "comment ca va", "comment tu vas", "tu me vois",
+      "tu es là", "tu es la", "tu m'entends", "tu m entends",
+      "il est quelle heure", "quelle heure est-il", "bonne nuit",
+      "arrête", "arrete", "stop", "tais toi", "silence",
+      "bonjour", "coucou", "salut", "hello", "bonsoir",
+      "orange", "rouge", "bleu", "bleue", "rose", "vert", "verte",
+      "violet", "violette", "jaune", "noir", "noire", "blanc", "blanche",
+      "sois orange", "sois rouge", "sois bleu", "sois bleue", "sois rose",
+      "sois vert", "sois verte", "sois violet", "sois violette",
+      "sois jaune", "sois noir", "sois noire", "sois blanc", "sois blanche",
+      "deviens orange", "deviens rouge", "couleur orange", "couleur rouge",
+      "rire", "sourire", "colère", "colere", "triste", "surprise", "dodo",
+      "fais dodo", "reviens à ta couleur", "reviens a ta couleur",
+      "couleur normale", "je suis strobi", "strobi"
+    };
+    foreach (var phrase in list) phrases.Add(phrase);
+    var builder = new GrammarBuilder();
+    if (culture != null) builder.Culture = culture;
+    builder.Append(phrases);
+    host.LoadGrammar(new Grammar(builder) { Name = "intents", Priority = 127 });
+    try {
+      host.LoadGrammar(new DictationGrammar() { Name = "dictation", Weight = 0.45f, Priority = 0 });
+    } catch {}
+  }
+
+  public static void Pump() {
+    string command;
+    while (Commands.TryDequeue(out command)) {
+      if (command == "Q") { Stop(); return; }
+      if (command == "P") Pause();
+      else if (command == "L") Resume();
+    }
+    if (needRestart && !paused && !running && !quit) {
+      needRestart = false;
+      StartAsync();
+    }
+  }
+
+  static void Pause() {
+    paused = true;
+    needRestart = false;
+    Cancel();
+  }
+
+  static void Resume() {
+    paused = false;
+    if (!running) StartAsync();
+  }
+
+  public static void Stop() {
+    quit = true;
+    paused = true;
+    needRestart = false;
+    Cancel();
+    lock (Gate) {
+      if (engine != null) {
+        try { engine.Dispose(); } catch {}
+        engine = null;
+      }
+    }
+    running = false;
+    Finished = true;
+  }
+
+  static void StartAsync() {
+    lock (Gate) {
+      if (quit || paused || running || engine == null) return;
+      try {
+        engine.RecognizeAsync(RecognizeMode.Multiple);
+        running = true;
+      } catch {
+        needRestart = true;
+      }
+    }
+  }
+
+  static void Cancel() {
+    lock (Gate) {
+      if (engine == null) return;
+      try { engine.RecognizeAsyncCancel(); } catch {}
+    }
+  }
+
+  static void StartStdinReader() {
+    var thread = new Thread(() => {
+      try {
+        string line;
+        while ((line = Console.In.ReadLine()) != null) {
+          Commands.Enqueue(line);
+          if (line == "Q") break;
+        }
+      } catch {}
+    });
+    thread.IsBackground = true;
+    thread.Start();
+  }
+
+  static string ToHex(string text) {
+    var bytes = Encoding.UTF8.GetBytes(text);
+    var builder = new StringBuilder(bytes.Length * 2);
+    foreach (var value in bytes) builder.Append(value.ToString("x2"));
+    return builder.ToString();
+  }
+
+  static void Write(string line) {
+    try {
+      Console.Out.WriteLine(line);
+      Console.Out.Flush();
+    } catch {}
+  }
+}
+'@
+
+function Install-ListenHost {
+  $speechAsm = [System.Speech.Recognition.SpeechRecognitionEngine].Assembly.Location
+  $dll = Join-Path $env:TEMP 'companion-stt-host-v6.dll'
+  if (Test-Path $dll) {
+    try {
+      [void][Reflection.Assembly]::LoadFrom($dll)
+      [void][ListenHost].Name
+      return
+    } catch {}
+  }
+  $refs = @($speechAsm, 'System.dll', 'System.Core.dll')
+  try {
+    Add-Type -TypeDefinition $ListenHostSource -ReferencedAssemblies $refs -OutputAssembly $dll -OutputType Library
+    [void][Reflection.Assembly]::LoadFrom($dll)
+  } catch {
+    try {
+      Add-Type -TypeDefinition $ListenHostSource -ReferencedAssemblies $refs
+    } catch {
+      [Console]::Out.WriteLine('E compile')
+      [Console]::Out.Flush()
+      exit 1
+    }
+  }
 }
 
-function New-Recognizer {
-  $installed = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-  $fr = $installed | Where-Object { $_.Culture.Name -like 'fr*' } | Select-Object -First 1
-  if ($fr) { return New-Object System.Speech.Recognition.SpeechRecognitionEngine($fr) }
-  return New-Object System.Speech.Recognition.SpeechRecognitionEngine
-}
-
-$engine = New-Recognizer
 try {
-  $engine.SetInputToDefaultAudioDevice()
+  Install-ListenHost
 } catch {
-  [Console]::Out.WriteLine('E mic')
+  [Console]::Out.WriteLine('E compile')
   [Console]::Out.Flush()
   exit 1
 }
-$engine.BabbleTimeout = [TimeSpan]::FromSeconds(1)
-$engine.InitialSilenceTimeout = [TimeSpan]::FromSeconds(4)
-$engine.EndSilenceTimeout = [TimeSpan]::FromMilliseconds(700)
 
-try {
-  $phrases = New-Object System.Speech.Recognition.Choices
-  @(
-    'comment tu t''appelles',
-    'qui es-tu',
-    'ça va',
-    'comment ça va',
-    'comment tu vas',
-    'tu me vois',
-    'tu es là',
-    'il est quelle heure',
-    'quelle heure est-il',
-    'bonne nuit',
-    'arrête',
-    'stop',
-    'bonjour',
-    'coucou',
-    'salut'
-  ) | ForEach-Object { [void]$phrases.Add($_) }
-  $builder = New-Object System.Speech.Recognition.GrammarBuilder
-  $builder.Append($phrases)
-  $engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar $builder))
-} catch {}
-
-try {
-  $engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
-} catch {}
-
-Register-ObjectEvent -InputObject $engine -EventName SpeechDetected -Action {
-  [Console]::Out.WriteLine('D')
-  [Console]::Out.Flush()
-} | Out-Null
-
-Register-ObjectEvent -InputObject $engine -EventName SpeechRecognized -Action {
-  $result = $EventArgs.Result
-  if (-not $result) { return }
-  if ($result.Confidence -lt 0.22) { return }
-  $text = $result.Text
-  if ([string]::IsNullOrWhiteSpace($text)) { return }
-  $bytes = [Text.Encoding]::UTF8.GetBytes($text)
-  $hex = -join ($bytes | ForEach-Object { $_.ToString('x2') })
-  $conf = [math]::Round($result.Confidence, 2)
-  [Console]::Out.WriteLine("R $conf $hex")
-  [Console]::Out.Flush()
-} | Out-Null
-
-$engine.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
-[Console]::Out.WriteLine('ok')
+$ready = [ListenHost]::Boot()
+[Console]::Out.WriteLine($ready)
 [Console]::Out.Flush()
+if ($ready -ne 'ok') { exit 1 }
 
 try {
-  while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    if ($line -eq 'Q') { break }
-    if ($line -eq 'P') {
-      try { $engine.RecognizeAsyncStop() } catch {}
-      [Console]::Out.WriteLine('ok')
-      [Console]::Out.Flush()
-      continue
-    }
-    if ($line -eq 'L') {
-      try { $engine.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple) } catch {}
-      [Console]::Out.WriteLine('ok')
-      [Console]::Out.Flush()
-    }
+  while (-not [ListenHost]::Finished) {
+    [ListenHost]::Pump()
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 25
   }
 } finally {
-  try { $engine.RecognizeAsyncStop() } catch {}
-  try { $engine.Dispose() } catch {}
+  try { [ListenHost]::Stop() } catch {}
 }
 "#;
 
@@ -129,11 +263,13 @@ pub struct ListenEngine {
 struct ListenInner {
     worker: Option<ListenWorker>,
     paused: bool,
+    dead: Arc<AtomicBool>,
 }
 
 struct ListenWorker {
     child: Child,
     stdin: ChildStdin,
+    dead: Arc<AtomicBool>,
 }
 
 impl ListenEngine {
@@ -142,6 +278,7 @@ impl ListenEngine {
             inner: Mutex::new(ListenInner {
                 worker: None,
                 paused: false,
+                dead: Arc::new(AtomicBool::new(true)),
             }),
             app: Mutex::new(None),
         }
@@ -154,13 +291,16 @@ impl ListenEngine {
     }
 
     pub fn start(&self) -> Result<(), String> {
-        let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
-        if inner.worker.is_some() {
-            inner.paused = false;
-            if let Some(worker) = inner.worker.as_mut() {
-                let _ = worker.send("L");
+        {
+            let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
+            if inner.worker_alive() {
+                inner.paused = false;
+                if let Some(worker) = inner.worker.as_mut() {
+                    let _ = worker.send("L");
+                }
+                return Ok(());
             }
-            return Ok(());
+            inner.drop_worker();
         }
         let app = self
             .app
@@ -169,6 +309,14 @@ impl ListenEngine {
             .and_then(|slot| slot.clone())
             .ok_or("app missing")?;
         let worker = ListenWorker::spawn(app)?;
+        let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
+        if inner.worker_alive() {
+            let mut extra = worker;
+            extra.kill();
+            inner.paused = false;
+            return Ok(());
+        }
+        inner.dead = worker.dead.clone();
         inner.worker = Some(worker);
         inner.paused = false;
         Ok(())
@@ -178,7 +326,9 @@ impl ListenEngine {
         let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
         inner.paused = true;
         if let Some(worker) = inner.worker.as_mut() {
-            worker.send("P")?;
+            if !worker.dead.load(Ordering::SeqCst) {
+                worker.send("P")?;
+            }
         }
         Ok(())
     }
@@ -187,27 +337,50 @@ impl ListenEngine {
         let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
         inner.paused = false;
         if let Some(worker) = inner.worker.as_mut() {
-            worker.send("L")?;
+            if !worker.dead.load(Ordering::SeqCst) {
+                worker.send("L")?;
+            }
         }
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
         let mut inner = self.inner.lock().map_err(|error| error.to_string())?;
-        if let Some(mut worker) = inner.worker.take() {
-            let _ = worker.send("Q");
-            worker.kill();
-        }
+        inner.drop_worker();
         inner.paused = false;
         Ok(())
     }
 
     pub fn is_running(&self) -> bool {
-        self.inner
-            .lock()
-            .ok()
-            .map(|inner| inner.worker.is_some() && !inner.paused)
-            .unwrap_or(false)
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        inner.worker_alive() && !inner.paused
+    }
+}
+
+impl ListenInner {
+    fn worker_alive(&mut self) -> bool {
+        let Some(worker) = self.worker.as_mut() else {
+            return false;
+        };
+        if worker.dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        match worker.child.try_wait() {
+            Ok(None) => true,
+            _ => {
+                worker.dead.store(true, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    fn drop_worker(&mut self) {
+        if let Some(mut worker) = self.worker.take() {
+            worker.kill();
+        }
+        self.dead.store(true, Ordering::SeqCst);
     }
 }
 
@@ -245,8 +418,14 @@ impl ListenWorker {
                 }
             }
         });
-        spawn_event_pump(app, rx);
-        Ok(Self { child, stdin })
+        if let Err(error) = wait_for_ready(&rx) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let dead = Arc::new(AtomicBool::new(false));
+        spawn_event_pump(app, rx, dead.clone());
+        Ok(Self { child, stdin, dead })
     }
 
     fn send(&mut self, line: &str) -> Result<(), String> {
@@ -255,12 +434,33 @@ impl ListenWorker {
     }
 
     fn kill(&mut self) {
+        self.dead.store(true, Ordering::SeqCst);
+        let _ = self.send("Q");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn spawn_event_pump(app: AppHandle, rx: Receiver<String>) {
+fn wait_for_ready(rx: &Receiver<String>) -> Result<(), String> {
+    loop {
+        match rx.recv_timeout(HOST_READY_TIMEOUT) {
+            Ok(line) if line.eq_ignore_ascii_case("ok") => return Ok(()),
+            Ok(line) => {
+                if let Some(code) = line.strip_prefix("E ") {
+                    return Err(listen_error_message(code));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err("La reconnaissance vocale Windows n’a pas démarré.".into())
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("La reconnaissance vocale Windows s’est arrêtée.".into())
+            }
+        }
+    }
+}
+
+fn spawn_event_pump(app: AppHandle, rx: Receiver<String>, dead: Arc<AtomicBool>) {
     thread::spawn(move || {
         while let Ok(line) = rx.recv() {
             if line.eq_ignore_ascii_case("ok") || line.is_empty() {
@@ -270,11 +470,31 @@ fn spawn_event_pump(app: AppHandle, rx: Receiver<String>) {
                 let _ = app.emit("companion://speech-start", ());
                 continue;
             }
+            if let Some(code) = line.strip_prefix("E ") {
+                let _ = app.emit("companion://listen-error", listen_error_message(code));
+                continue;
+            }
             if let Some(payload) = parse_transcript(&line) {
                 let _ = app.emit("companion://transcript", payload);
             }
         }
+        dead.store(true, Ordering::SeqCst);
+        let _ = app.emit(
+            "companion://listen-error",
+            "Écoute locale arrêtée. Je réessaie.".to_string(),
+        );
     });
+}
+
+fn listen_error_message(code: &str) -> String {
+    match code.trim() {
+        "mic" => "Micro Windows indisponible. Active le micro dans Paramètres.".into(),
+        "norecog" => {
+            "Reconnaissance vocale Windows absente. Installe le pack de langue vocale.".into()
+        }
+        "compile" | "start" => "Écoute locale indisponible.".into(),
+        other => format!("Écoute locale : {other}"),
+    }
 }
 
 fn parse_transcript(line: &str) -> Option<TranscriptPayload> {
